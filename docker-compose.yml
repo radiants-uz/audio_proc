@@ -1,0 +1,54 @@
+name: audio-processor
+
+services:
+  db:
+    image: postgres:17-trixie
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_BACKEND_USER: ${POSTGRES_BACKEND_USER}
+      POSTGRES_BACKEND_PASSWORD: ${POSTGRES_BACKEND_PASSWORD}
+      POSTGRES_BACKEND_MIGRATOR_USER: ${POSTGRES_BACKEND_MIGRATOR_USER}
+      POSTGRES_BACKEND_MIGRATOR_PASSWORD: ${POSTGRES_BACKEND_MIGRATOR_PASSWORD}
+      POSTGRES_BACKEND_DB: ${POSTGRES_BACKEND_DB}
+    expose:
+      - 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./.infra/postgres/init.sh:/docker-entrypoint-initdb.d/init.sh
+    networks:
+      - audio-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: always
+
+  redis:
+    # Redis Stack: прогресс задач хранится как RedisJSON (JSON.SET/JSON.GET).
+    image: redis/redis-stack-server:7.4.0-v8
+    environment:
+      - REDIS_ARGS=--requirepass ${REDIS_PASSWORD} --appendonly yes
+    volumes:
+      - redisdata:/data
+    expose:
+      - 6379
+    networks:
+      - audio-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: always
+
+networks:
+  audio-net:
+
+volumes:
+  pgdata:
+  redisdata:

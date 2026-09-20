@@ -1,0 +1,120 @@
+name: audio-processor
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z
+    # Host ports are configurable: ark-backend (9000) and doc-proc (9100) run
+    # side by side on a developer machine, audio-proc defaults to 9200.
+    ports:
+      - "${MINIO_HOST_PORT:-9200}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-9201}:9001"
+    volumes:
+      - miniodata:/data
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - audio-net
+
+  setup-minio:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_STORAGE_BUCKET: ${S3_STORAGE_BUCKET}
+      S3_ASSETS_BUCKET: ${S3_ASSETS_BUCKET}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_USER: ${S3_USER}
+      S3_USER_PASS: ${S3_USER_PASS}
+    volumes:
+      - ./.docker/minio/policies:/policies
+      - ./.docker/minio/init_minio.sh:/init_minio.sh
+    entrypoint: ["/bin/sh", "/init_minio.sh"]
+    restart: on-failure
+    networks:
+      - audio-net
+
+  backend-api:
+    build:
+      context: ./backend
+      target: dev
+      args:
+        WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-1}
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    volumes:
+      - ./backend:/app
+    ports:
+      - "${BACKEND_HOST_PORT:-8100}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      backend-migrate:
+        condition: service_completed_successfully
+    networks:
+      - audio-net
+
+  backend-worker:
+    build:
+      context: ./backend
+      target: dev
+      args:
+        WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-1}
+    command: arq app.workers.arq_worker.WorkerSettings
+    env_file: .env
+    volumes:
+      - ./backend:/app
+      # Модели HF скачиваются один раз и делятся между воркерами.
+      - hf-cache:/home/appuser/.cache
+      - worker-tmp:/tmp/audio-proc
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      backend-migrate:
+        condition: service_completed_successfully
+    networks:
+      - audio-net
+
+  backend-migrate:
+    build:
+      context: ./backend
+      target: dev
+      args:
+        WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-1}
+    command: alembic upgrade head
+    env_file: .env
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - audio-net
+
+volumes:
+  miniodata:
+  hf-cache:
+  worker-tmp:

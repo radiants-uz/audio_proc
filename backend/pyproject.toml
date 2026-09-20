@@ -1,0 +1,60 @@
+[project]
+name = "audio-processor"
+version = "0.1.0"
+description = "Multi-speaker speech recognition (uz/ru/en) with diarization, LLM analysis and reports — a doc-proc-style service for ARK"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # --- как в doc-proc ---
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0.30",
+    "alembic>=1.13",
+    "asyncpg>=0.29",
+    "psycopg2-binary>=2.9.9",
+    "arq>=0.26,<0.29",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "sqladmin[full]>=0.18",
+    "python-multipart>=0.0.9",
+    "aioboto3>=13.0",
+    "redis>=5.0",
+    "httpx>=0.27",
+    # --- аудио-пайплайн ---
+    "numpy>=1.26,<3",
+    "soundfile>=0.12",
+    "torch>=2.4",
+    "torchaudio>=2.4",
+    "pyannote.audio>=3.3",
+    "speechbrain>=1.0",
+    "scikit-learn>=1.4",
+    "silero-vad>=5.1",
+    "onnxruntime>=1.18",
+    # --- анализ и отчёты ---
+    "openai>=1.40",
+    "python-docx>=1.1",
+    "matplotlib>=3.8",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+# B008: Depends()/Form()/File() в аргументах — идиома FastAPI.
+ignore = ["B008", "E501"]

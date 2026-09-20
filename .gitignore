@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.env
+# TLS-сертификаты nginx (генерируются scripts/gen-selfsigned-cert.sh или кладутся руками)
+.docker/nginx/certs/*.pem
+
+# Локальные данные разработки
+.hf-cache/
+eval/data/
+*.wav
+*.mp3
+*.m4a
+backend/.env

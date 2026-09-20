@@ -1,0 +1,835 @@
+# План реализации: многоспикерное распознавание речи (uz / ru / en) с диаризацией
+
+> Этот документ — техническое задание для Claude Code. Прочитай его целиком перед тем, как писать код.
+> Стек бэкенда: **Python 3.12, FastAPI, arq, PyTorch**. Клиент — ARK (см. «Решения» ниже и §14).
+
+---
+
+## Решения от 2026-09-20 (имеют приоритет над разделами ниже)
+
+| Тема | Решение |
+|---|---|
+| Клиент сервиса | **Не Flutter, а ARK** (`ark-backend` Django/Celery + `ark-frontend` React). Сервис работает по образцу `doc-proc`: `X-API-Key`, `POST … → 202 {task_id}`, ARK опрашивает `GET /v1/audio/tasks/{task_id}`, результат — presigned-ссылка на MinIO. Колбэков нет. Старый контракт §6 «для Flutter» заменён (см. новый §6). |
+| Стек | Как у doc-proc: FastAPI + arq + Redis Stack (JSON) + Postgres/alembic + MinIO + sqladmin, `uv`. Python **3.12** (torch/pyannote/speechbrain ещё не собраны под 3.14 — единственное отличие от doc-proc). |
+| LLM для анализа | **Только GLM-5.3 заказчика** (self-hosted, OpenAI-совместимый). Бэкенда Anthropic нет вообще. Контекст локальной модели **120k**, поэтому `max_input_tokens: 40000`, `chunk_tokens: 30000` (map-reduce включается чаще, чем предполагалось). `reasoning_effort: low`. Строгий `response_format: json_schema` через SGLang **ломает ответ** (пустые списки, пропущенные поля — проверено 2026-09-20), поэтому схема вкладывается в промпт + `response_format: json_object`. |
+| ASR-API | `POST https://stt.robot-guide.iccu.uz/api/v1/asr/transcribe`, multipart `file` + `language_code` ∈ {`uz`,`ru`,`en`}, ответ `{"transcription": "..."}`, без авторизации. Тот же сервис уже используется ассистентом ARK (`apps/assistant/services/stt.py`). Куски ≤ 30 с, wav 16k mono. На 2026-09-20 отвечает 502 — для разработки есть `ASR_BACKEND=mock`. |
+| Диаризация | HF-токена нет. Основной бэкенд `pyannote` (gated, нужен `HF_TOKEN` — завести бесплатно и принять условия модели). Для разработки без токена — бэкенд `simple`: silero-VAD + эмбеддинги `speechbrain/spkrec-ecapa-voxceleb` + агломеративная кластеризация. Переключается конфигом `DIARIZATION_BACKEND`. |
+| Железо | Пока разработка на MacBook (M4, 16 ГБ, CPU/MPS). GPU-сервер появится позже; код device-agnostic (`DEVICE=cpu|cuda|mps`). |
+| ARK | Делаем и бэкенд (`apps/audioproc` по образцу `apps/docproc`), и фронтенд (страница обработки аудио + настройки в админке). |
+| Отчёт | Шаблон .docx от заказчика отсутствует — отчёт собирается кодом (`python-docx`), тексты секций на ru/uz/en. PDF через LibreOffice. |
+| Порты dev | API `8100`, MinIO `9200/9201` (8000 и 9000/9100 заняты ARK и doc-proc). |
+
+---
+
+## 0. Что нужно получить
+
+На вход подаётся аудиофайл (запись совещания/разговора). На выходе — три вещи, каждая по запросу клиента:
+
+1. **Транскрипт (JSON):** список спикеров (SPEAKER_00 … SPEAKER_14) с языком каждого; список реплик в хронологическом порядке: кто, когда (start/end), на каком языке, что сказал. Текст каждой реплики распознан **моделью именно того языка**, на котором говорит спикер.
+2. **Анализ (JSON):** суть разговора — краткое резюме, ключевые темы, принятые решения, задачи/поручения, позиция каждого спикера, статистика (кто сколько говорил, на каких языках). Делается LLM по транскрипту.
+3. **Отчёт (файл):** тот же анализ + транскрипт, оформленные как документ — **PDF или Word (.docx)**, формат выбирает клиент в запросе.
+
+Клиент может запросить только транскрипт, транскрипт + анализ, или всё вместе с отчётом. Анализ и отчёт стоят денег (LLM) и времени, поэтому по умолчанию выключены.
+
+### Допущения (важно, от них зависят решения ниже)
+
+| Параметр | Значение |
+|---|---|
+| Число спикеров | 3–15, заранее неизвестно |
+| Режим речи | По очереди (один говорит 5–60 с, потом другой) |
+| Наложения голосов | Редко (~10% мест), 2–3 голоса, короткие. **Разделять голоса НЕ нужно** — только пометить |
+| Языки | Только `uz`, `ru`, `en`. Других нет |
+| Язык спикера | Как правило постоянный на всю запись. Переключение языка одним человеком — редкий случай, обрабатывается опционально |
+| Длина записи | До ~2 часов |
+| Обработка | Офлайн (загрузил файл → подождал → получил JSON). Не стриминг |
+
+### Не-цели (v1)
+- Разделение наложенных голосов (source separation) — нет.
+- Стриминг/реалтайм — нет.
+- Идентификация спикеров по имени (voiceprint) — нет, только SPEAKER_NN.
+- Перевод — нет.
+
+---
+
+## 1. Существующий ASR-API — используем его
+
+У заказчика уже поднят сервер с тремя моделями:
+
+| lang | Модель |
+|---|---|
+| `uz` | `nvidia/stt_uz_fastconformer_hybrid_large_pc` |
+| `ru` | `gigaam-v3-e2e-rnnt` |
+| `en` | `nvidia/parakeet-tdt-0.6b-v2` |
+
+Контракт API (уточнить у заказчика точный URL/поля, см. §11): **вход** `lang` + аудио, **выход** — строка текста.
+
+**Решение:** это подходит. Таймкоды реплик берём из диаризации, а API вызываем на каждом вырезанном куске аудио. Пословные таймкоды API не возвращает — это ограничение v1 (см. §8, опциональный этап M7).
+
+**Обязательно:** ASR вызывается через абстракцию `AsrClient` (см. §5.4), чтобы переключение на локальные модели на GPU было изменением конфига, а не переписыванием кода.
+
+---
+
+## 2. Архитектура пайплайна
+
+```
+audio file (any format)
+   │
+   ▼
+[1] Ingest: ffmpeg → 16 kHz mono PCM WAV (в tmp-директорию job'а)
+   │
+   ▼
+[2] Diarization: pyannote.audio 4.x, pipeline "pyannote/speaker-diarization-community-1"
+      → speaker_diarization (с наложениями) + exclusive_speaker_diarization (без наложений)
+   │
+   ▼
+[3] Segment builder: чистка/склейка/разрезание сегментов, флаги overlap
+   │
+   ▼
+[4] Language ID (per speaker): speechbrain/lang-id-voxlingua107-ecapa,
+      softmax ограничен классами {uz, ru, en} → язык каждого спикера
+   │
+   ▼
+[5] ASR routing: для каждого сегмента вырезать WAV → AsrClient.transcribe(lang, wav)
+      (батчами по языку, с параллелизмом)
+   │
+   ▼
+[6] Assembler: собрать транскрипт JSON → S3 result.json
+   │
+   ▼  (только если запрошено)
+[7] Analysis: LLM по транскрипту → analysis.json (резюме, темы, решения, задачи, спикеры, статистика)
+   │
+   ▼  (только если запрошено)
+[8] Report: analysis + transcript → шаблон .docx → report.docx и/или report.pdf → S3
+```
+
+### Топология развёртывания
+
+```
+┌──────────────────────┐   HTTPS   ┌──────────────────────────── STT-сервер (GPU) ───────────────────────────────┐
+│ Проект заказчика     │ ───────▶  │  api (FastAPI, без моделей)                                                 │
+│ (ARK backend)        │ ◀───────  │     │ upload → S3, enqueue → Redis, status ← Redis, result ← S3            │
+└──────────────────────┘           │     ▼                                                                       │
+                                   │  Redis ── ТОЛЬКО очередь job'ов + статус/прогресс/heartbeat (эфемерное)     │
+                                   │     ▲                                                                       │
+                                   │     │ pop job                                                               │
+                                   │  worker-1 ─┐                                                               │
+                                   │  worker-2 ─┼─ pyannote + LID в памяти; S3 ⇄ локальный tmp; HTTP → ASR API   │
+                                   │  worker-N ─┘                                                               │
+                                   └────────┬──────────────────────────────────────┬───────────────────────────────┘
+                                            │ S3 API                               │ HTTP (внутренняя сеть)
+                              ┌─────────────▼──────────────┐         ┌─────────────▼──────────────┐
+                              │ MinIO / S3                 │         │ ASR-API заказчика          │
+                              │ ПОСТОЯННОЕ ХРАНИЛИЩЕ:      │         │ (uz / ru / en модели)       │
+                              │ исходное аудио, wav16k,    │         │ НЕ МЕНЯЕТСЯ                 │
+                              │ result.json                │         └────────────────────────────┘
+                              └────────────────────────────┘
+```
+
+Роли:
+
+- **api** — FastAPI. Принимает файл, потоково загружает его в S3 (`jobs/{id}/input.<ext>`), создаёт запись job в Redis, ставит job в очередь. Моделей не грузит, GPU не трогает, может быть 1–2 реплики. Локального диска не использует.
+- **worker** — процесс с загруженными pyannote + LID. Берёт job из очереди Redis, скачивает исходник из S3 во временную директорию, выполняет пайплайн (§2), загружает `result.json` (и `audio16k.wav`, если включено) в S3, пишет финальный статус в Redis, удаляет временные файлы.
+- **redis** — очередь, статусы, прогресс, heartbeat воркеров. Ничего долговечного здесь не лежит: потеря Redis = потеря очереди и статусов незавершённых job'ов, но не данных.
+- **MinIO / S3** — единственное постоянное хранилище. Всё, что должно пережить перезапуск или понадобиться клиенту, лежит здесь. Lifecycle-политика бакета удаляет объекты по TTL.
+
+Shared volume между api и воркерами **не нужен** — обмен файлами идёт только через S3.
+
+Обработка долгая (минуты), поэтому асинхронная модель "job": `POST /jobs` → `job_id`, `GET /jobs/{id}` → статус/результат. Клиент (проект заказчика) не держит соединение, а опрашивает статус.
+
+---
+
+## 3. Структура репозитория
+
+> Актуальная структура — как у doc-proc (`backend/app/{api,core,crud,models,schemas,services,workers,admin,exceptions}` + `alembic` + `tests`), пайплайн лежит в `backend/app/services/audio_processing/`. Ниже — исходная схема модулей пайплайна, имена файлов внутри пайплайна сохранены.
+
+```
+stt-service/
+├── pyproject.toml
+├── README.md
+├── config.yaml                  # см. §9
+├── .env.example                 # HF_TOKEN, ASR_API_URL, ...
+├── Dockerfile                   # один образ; роль задаётся командой запуска (api | worker)
+├── docker-compose.yaml          # api + worker (масштабируется: --scale worker=N) + redis
+├── app/
+│   ├── main.py                  # FastAPI, роуты
+│   ├── api/
+│   │   ├── routes_jobs.py       # POST /jobs, GET /jobs/{id}, GET /jobs/{id}/result
+│   │   └── schemas.py           # Pydantic-модели ответов (§7)
+│   ├── core/
+│   │   ├── config.py            # загрузка config.yaml + env
+│   │   ├── jobs.py              # JobStore поверх Redis: create/get/update_progress/set_status, TTL
+│   │   ├── queue.py             # постановка в очередь / получение задач (RQ)
+│   │   ├── storage.py           # ObjectStore поверх S3/MinIO (boto3): put/get/presign/delete
+│   │   └── logging.py
+│   ├── pipeline/
+│   │   ├── ingest.py            # ffmpeg → wav16k
+│   │   ├── diarize.py           # pyannote
+│   │   ├── segments.py          # Segment builder
+│   │   ├── langid.py            # LID per speaker
+│   │   ├── asr/
+│   │   │   ├── base.py          # Protocol AsrClient
+│   │   │   ├── remote_api.py    # клиент существующего API заказчика
+│   │   │   └── local_nemo.py    # (позже) локальные модели на GPU
+│   │   ├── router.py            # выбор клиента, батчинг, параллелизм
+│   │   ├── assemble.py          # транскрипт JSON
+│   │   ├── analysis/
+│   │   │   ├── llm_base.py      # Protocol LlmClient
+│   │   │   ├── llm_openai.py    # OpenAI-совместимый клиент GLM-5.3 (vLLM/SGLang)
+│   │   │   ├── prompts.py       # промпты анализа (ru/uz/en)
+│   │   │   └── analyze.py       # оркестрация анализа, валидация JSON
+│   │   ├── report/
+│   │   │   ├── build.py         # analysis + transcript → docx → pdf
+│   │   │   ├── charts.py        # диаграммы (matplotlib → PNG)
+│   │   │   └── templates/
+│   │   │       ├── report_ru.docx
+│   │   │       ├── report_uz.docx
+│   │   │       └── report_en.docx
+│   │   └── run.py               # оркестрация всех шагов
+│   └── worker.py                # точка входа воркера: грузит модели один раз, затем цикл RQ
+├── eval/
+│   ├── data/                    # тестовые записи + эталонные разметки (не в git)
+│   ├── eval_der.py              # DER диаризации
+│   ├── eval_lid.py              # точность LID
+│   └── eval_wer.py              # WER по языкам
+└── tests/
+    ├── test_segments.py
+    ├── test_langid.py
+    └── test_assemble.py
+```
+
+---
+
+## 4. Зависимости
+
+```
+python >= 3.11
+torch (CUDA)
+pyannote.audio >= 4.0          # диаризация; модель gated на HF — нужен HF_TOKEN и принятые условия
+speechbrain                    # LID
+soundfile, numpy
+ffmpeg (системный бинарник)
+fastapi, uvicorn, python-multipart
+httpx                          # вызов ASR API
+pydantic >= 2
+redis + rq                     # очередь job'ов и статусы
+boto3                          # S3 / MinIO
+pyyaml
+jiwer                          # WER для eval
+pyannote.metrics               # DER для eval
+
+# анализ и отчёты
+openai                         # OpenAI-совместимый клиент для GLM-5.3
+docxtpl                        # заполнение .docx-шаблона (Jinja2 внутри Word)
+python-docx                    # низкоуровневая правка docx (таблицы транскрипта)
+matplotlib                     # диаграммы для отчёта
+libreoffice (системный)        # docx → pdf, headless
+шрифты: fonts-noto, fonts-dejavu (системные) — кириллица + узбекская латиница (oʻ, gʻ, ʻ)
+```
+
+Примечание: `nemo_toolkit` **не ставим** в v1 — ASR идёт через внешний API. Добавляется только в M8, если решим хостить модели сами.
+
+---
+
+## 5. Детальное описание шагов
+
+### 5.1 Ingest (`pipeline/ingest.py`)
+
+- Воркер скачивает `jobs/{id}/input.<ext>` из S3 во временную директорию job'а (`/tmp/stt/{job_id}/`), локальный SSD.
+- `ffmpeg -i input -ac 1 -ar 16000 -sample_fmt s16 -f wav audio16k.wav`
+- Принимать любые контейнеры (mp3, m4a, ogg, wav, mp4 — брать аудиодорожку).
+- Вернуть путь к wav и длительность (сек).
+- Отклонить файл, если длительность < 1 с или > `max_duration_sec` из конфига.
+- Если `storage.keep_wav: true` — загрузить `audio16k.wav` в S3 (полезно для eval и повторной обработки); по умолчанию `false`.
+
+### 5.2 Diarization (`pipeline/diarize.py`)
+
+```python
+from pyannote.audio import Pipeline
+pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=HF_TOKEN)
+pipeline.to(torch.device("cuda"))
+output = pipeline(wav_path, min_speakers=cfg.min_speakers, max_speakers=cfg.max_speakers)
+# output.speaker_diarization            — обычная (сегменты могут пересекаться)
+# output.exclusive_speaker_diarization  — эксклюзивная (в каждый момент один спикер)
+```
+
+- Загружать pipeline **один раз** при старте воркера (singleton), не на каждый job.
+- Возвращать два списка `RawTurn(start, end, speaker)`: `turns` и `exclusive_turns`.
+- `min_speakers`/`max_speakers` — из конфига (по умолчанию 1 и 15); клиент может переопределить в запросе (`expected_speakers`).
+- Логировать: число найденных спикеров, суммарную речь по каждому.
+
+### 5.3 Segment builder (`pipeline/segments.py`)
+
+Вход: `exclusive_turns` (основа для текста) и `turns` (для флагов overlap). Выход: `list[Segment]`.
+
+```python
+@dataclass
+class Segment:
+    id: int
+    speaker: str
+    start: float
+    end: float
+    overlap: bool
+    overlap_with: list[str]   # другие спикеры, чья речь пересекается с этим сегментом
+```
+
+Правила (все пороги — в конфиге):
+
+1. **Склейка:** соседние сегменты одного спикера с паузой < `merge_gap_sec` (0.5 с) объединить.
+2. **Фильтр коротких:** сегменты < `min_segment_sec` (0.4 с) удалить (это обычно «угу», шум).
+3. **Разрезание длинных:** сегменты > `max_segment_sec` (30 с) разрезать. Точка разреза — самая длинная пауза внутри сегмента (ищем по энергии/VAD-маске в окне ±3 с от целевой точки); если паузы нет — резать ровно по `max_segment_sec`. 30 с — верхняя граница для большинства ASR-моделей.
+4. **Overlap:** для каждого сегмента посмотреть в `turns`: если есть чужой turn, пересекающийся с ним более чем на `overlap_min_sec` (0.3 с), поставить `overlap=true` и заполнить `overlap_with`.
+5. **Padding:** при вырезании аудио для ASR добавлять `pad_sec` (0.15 с) с каждой стороны (не выходя за границы файла и не заезжая в соседний сегмент другого спикера более чем на 0.1 с) — первые/последние фонемы иначе теряются.
+6. Отсортировать по `start`, присвоить `id`.
+
+Написать unit-тесты на 1–4 (синтетические turns).
+
+### 5.4 Language ID per speaker (`pipeline/langid.py`)
+
+Ключевая идея: язык определяется **на спикера**, не на сегмент. Это резко снижает ошибки.
+
+Алгоритм:
+
+1. Для каждого спикера взять его сегменты с `overlap=false`, отсортировать по длительности (длинные первые), набрать до `lid_audio_sec` (20 с) аудио, склеить в один массив.
+2. Если у спикера < `lid_min_audio_sec` (2 с) чистой речи — использовать и overlap-сегменты; если и так мало — язык = `lid_fallback` (см. п. 5).
+3. Прогнать через `speechbrain/lang-id-voxlingua107-ecapa` (`EncoderClassifier.from_hparams(...)`, `classify_batch`), взять **логиты**, а не финальный argmax.
+4. Взять логиты только по трём меткам VoxLingua: `uz`, `ru`, `en` (найти индексы в `label_encoder`), сделать softmax по этим трём → `lang`, `confidence`.
+5. Если `confidence < lid_min_confidence` (0.6) — ставить язык = язык большинства спикеров файла (посчитать после первого прохода) и пометить `lang_confidence` низкой; в JSON поле сохраняется, клиент может показать предупреждение.
+6. (Опционально, флаг `lid_per_segment_recheck: true`) Для сегментов длиннее 4 с прогнать LID отдельно; если результат отличается от языка спикера с confidence > 0.9 — присвоить сегменту свой язык (код-свитчинг). По умолчанию выключено.
+
+Модель LID грузить один раз при старте воркера.
+
+### 5.5 ASR-клиент (`pipeline/asr/`)
+
+`base.py`:
+
+```python
+from typing import Protocol
+
+@dataclass
+class AsrWord:
+    word: str
+    start: float   # относительно начала переданного куска
+    end: float
+
+@dataclass
+class AsrResult:
+    text: str
+    words: list[AsrWord] | None = None   # None, если бэкенд не отдаёт слова
+
+class AsrClient(Protocol):
+    async def transcribe(self, lang: str, wav_bytes: bytes) -> AsrResult: ...
+    async def transcribe_batch(self, lang: str, items: list[bytes]) -> list[AsrResult]: ...
+```
+
+`remote_api.py` — клиент существующего API заказчика:
+
+- `httpx.AsyncClient` с таймаутом `asr_timeout_sec` (60), ретраи (3, экспоненциальная пауза) на 5xx/таймаут.
+- Поля запроса/URL — из конфига (`asr_api.url`, `asr_api.lang_field`, `asr_api.audio_field`, `asr_api.text_field_in_response`). **Точный контракт уточнить у заказчика** (§11).
+- `transcribe_batch` по умолчанию = параллельные `transcribe` с семафором `asr_concurrency` (4). Если у API есть батч-эндпоинт — использовать его.
+- Пустой ответ → `text=""`, не ошибка.
+- `words=None` (API отдаёт только текст).
+
+`local_nemo.py` — заглушка с `NotImplementedError` и TODO; реализуется в M8.
+
+### 5.6 Router (`pipeline/router.py`)
+
+**Язык каждого куска определяет наша сторона (§5.4), а не ASR-API.** К моменту роутинга у каждого сегмента уже есть `language` (унаследован от спикера или уточнён recheck'ом). ASR-API получает готовую пару `lang` + аудио и ничего не определяет сам.
+
+- Сгруппировать сегменты по языку → для каждого языка вызвать `transcribe_batch`.
+- Языки обрабатывать параллельно (`asyncio.gather`), внутри языка — семафор.
+- Для каждого сегмента: вырезать wav с padding (§5.3 п.5), кодировать в WAV 16k mono PCM16 bytes.
+- Результат привязать к `segment.id`. Если пришли `words` — прибавить `segment.start - pad_left` к каждому `start/end`, обрезать по границам сегмента.
+- Прогресс job'а обновлять после каждого батча (`progress: 0.0–1.0`).
+
+### 5.7 Assembler (`pipeline/assemble.py`)
+
+Собрать финальный JSON по схеме §7 и загрузить его в S3 как `jobs/{id}/result.json` (`Content-Type: application/json`). После успешной загрузки — `HSET job:{id} status done result_key jobs/{id}/result.json`. Порядок важен: сначала объект в S3, потом статус в Redis, иначе клиент может увидеть `done` без результата.
+
+Правила:
+
+- `segments` отсортированы по `start`.
+- Сегменты с пустым `text` после ASR **оставлять**, но с `text: ""` — клиент решает, показывать или нет.
+- `speakers[].total_speech` — сумма длительностей сегментов спикера.
+- `speakers` отсортированы по `total_speech` убыв.; **id спикеров переименовать** в порядке первого появления: первый заговоривший → `SPEAKER_00`, и т.д. (pyannote даёт произвольные метки).
+- `meta` — версии моделей, время обработки по шагам, конфиг порогов.
+
+### 5.8 Analysis (`pipeline/analysis/`)
+
+Выполняется только если в job'е запрошено `analysis` или `report`. Вход — транскрипт §7. Выход — `analysis.json` по схеме §7.1.
+
+**Выбор LLM.** Транскрипт может быть на узбекском, русском и английском вперемешку; резюме нужно на языке, который выбрал клиент.
+
+**Решение заказчика: GLM-5.3, развёрнутая у заказчика** (self-hosted, OpenAI-совместимый эндпоинт через vLLM/SGLang). Подключается через бэкенд `openai_compatible`. Что важно знать про неё:
+
+- **Контекст локально поднятой модели — 120k токенов** (не 1M). Порог одного запроса `max_input_tokens: 40000`, размер куска map-reduce `chunk_tokens: 30000`.
+- Structured output: **не** через `response_format: json_schema` — на GLM-5.3-NVFP4 через SGLang constrained decoding возвращает пустые `decisions`/`action_items` и пропускает обязательные поля (2026-09-20). Рабочий режим: JSON-схема §7.1 в системном промпте + `response_format: {"type": "json_object"}`, ответ валидируется Pydantic, один повтор с текстом ошибки.
+- Reasoning всегда включён, отключить нельзя; уровни `low` / `high` / `max`, по умолчанию `max`. Для анализа ставить `reasoning_effort: low` (параметр в конфиге), иначе запросы будут медленными и дорогими по токенам. Если эндпоинт возвращает reasoning-контент отдельным полем — игнорировать его, брать только `message.content`.
+- Модель ориентирована на код и агентные задачи; качество резюме на **узбекском** заранее неизвестно — обязательная проверка на M9. Если окажется слабым, промпт для `report_lang=uz` можно переформулировать через промежуточный русский/английский анализ с финальным переводом, либо подключить внешний API — интерфейс `LlmClient` это позволяет без переписывания.
+
+Других LLM-бэкендов нет: решение заказчика — только своя GLM-5.3. `LlmClient` остаётся протоколом на случай смены модели.
+
+`llm_base.py`:
+
+```python
+class LlmClient(Protocol):
+    async def complete_json(self, system: str, user: str, schema: dict, max_tokens: int) -> dict: ...
+```
+
+**Алгоритм:**
+
+1. Сформировать текст транскрипта для промпта: одна реплика — одна строка `[HH:MM:SS] SPEAKER_03 (uz): текст`. Сегменты с `overlap=true` помечать `[overlap]`, с пустым текстом — пропускать.
+2. Определить `report_lang`: из параметра job'а, иначе — язык спикера с наибольшим `total_speech_sec`.
+3. Если транскрипт > `analysis.max_input_tokens` (**40k**, контекст локальной GLM-5.3 — 120k, запас на промпт, reasoning и вывод) — map-reduce: разбить по `chunk_tokens` (**30k**) на границах реплик, для каждого куска получить промежуточный анализ, затем итоговый прогон по промежуточным. Двухчасовой транскрипт (~40–60k токенов) обычно попадает в map-reduce — это штатный путь, а не страховка.
+4. Один вызов `complete_json` с системным промптом (`prompts.py`, версия под `report_lang`) и JSON-схемой §7.1. Ключевые требования в промпте:
+   - писать **только на `report_lang`**, цитаты спикеров — на языке оригинала с переводом в скобках;
+   - опираться только на транскрипт, ничего не додумывать; если решения/задачи не прозвучали — вернуть пустые списки, а не выдуманные;
+   - каждое решение и задача — со ссылкой на `segment_ids`, откуда оно взято (для проверяемости и для ссылок в отчёте);
+   - учитывать, что ASR не идеален: явно неразборчивые фрагменты не интерпретировать.
+5. Валидировать ответ Pydantic-моделью; при ошибке — один повтор с сообщением об ошибке валидации; если снова невалидно — job `done` с `analysis: null` и warning `analysis_failed` (транскрипт не должен пропадать из-за LLM).
+6. Сохранить `jobs/{id}/analysis.json` в S3, записать `analysis_key` в Redis.
+7. Статистику (`stats` в §7.1) считать **кодом**, не LLM: доли времени по спикерам и языкам, число реплик, число наложений, средняя длина реплики. LLM получает эти числа как контекст.
+
+Ретраи к LLM API: 3, экспоненциальная пауза; таймаут `analysis.timeout_sec` (300).
+
+### 5.9 Report (`pipeline/report/`)
+
+Выполняется только если запрошен `report`. Вход — транскрипт + `analysis.json`. Выход — `report.docx` и/или `report.pdf` в S3.
+
+**Подход: один источник — .docx-шаблон, PDF получается конвертацией.** Так оба формата выглядят одинаково и правится только один шаблон.
+
+- `docxtpl` заполняет шаблон `templates/report_{lang}.docx` (Jinja2-теги прямо в Word: `{{ summary }}`, `{% for d in decisions %}`). Шаблон готовится дизайнером/заказчиком в Word — логотип, шрифты, цвета; код туда не лезет.
+- Таблицы транскрипта и участников вставляются `python-docx` (docxtpl умеет и через `{% tr %}`, но для длинных таблиц удобнее кодом).
+- Диаграммы (`charts.py`): доля времени по спикерам (горизонтальный bar), доля по языкам (bar) — matplotlib → PNG → `InlineImage`.
+- PDF: `libreoffice --headless --convert-to pdf report.docx`. LibreOffice ставится в образ воркера; шрифты Noto/DejaVu обязательны, иначе узбекские `oʻ gʻ` и кириллица заменятся квадратами.
+- Если запрошены оба формата — docx строится один раз, pdf из него.
+
+**Структура отчёта (по секциям шаблона):**
+
+1. Титул: название (из параметра `title` или имя файла), дата записи/обработки, длительность, число участников, языки.
+2. Резюме (`summary`).
+3. Ключевые темы (`topics`) — по каждой 2–4 предложения.
+4. Решения (`decisions`) — таблица: решение, кто озвучил, таймкод.
+5. Задачи / поручения (`action_items`) — таблица: задача, ответственный (спикер), срок если прозвучал, таймкод.
+6. Участники (`speakers`) — таблица: SPEAKER_NN, язык, время речи, доля, краткая позиция/роль в разговоре.
+7. Статистика — две диаграммы + число наложений.
+8. Приложение: полный транскрипт — таблица «время | спикер | язык | текст», сегменты с `overlap` помечены.
+9. Колонтитул: `job_id`, версия пайплайна, дисклеймер «текст получен автоматическим распознаванием, возможны ошибки».
+
+Имена спикеров: если клиент передал `speaker_names` (`{"SPEAKER_00": "Алишер"}`) в `POST /jobs` или позже в `POST /jobs/{id}/report`, они подставляются везде вместо `SPEAKER_NN`.
+
+Отчёт можно **перегенерировать без повторного распознавания**: `POST /jobs/{id}/report` берёт `result.json` и `analysis.json` из S3 (анализ пересчитывается только если его ещё нет или передан `regenerate_analysis: true`).
+
+---
+
+## 6. HTTP API сервиса (контракт как у doc-proc, клиент — ARK)
+
+Сервис повторяет контракт `doc-proc`, чтобы на стороне ARK `apps/audioproc` был копией `apps/docproc`.
+
+| Метод | Путь | Описание |
+|---|---|---|
+| `GET` | `/health` | **без ключа**: `{"status": "ok"}` (ARK проверяет URL этим запросом). `/health/deep` — с ключом: Redis, S3, Postgres, ASR-API, LLM, живые воркеры, длина очереди |
+| `POST` | `/v1/audio/transcribe` | multipart `file`. Опц. поля формы: `expected_speakers` (int), `lid_recheck` (bool), `speaker_names` (json-строка `{"SPEAKER_00": "Алишер"}`), `title`. Ответ **`202 {"task_id": "..."}`** + заголовок `Location` на прогресс |
+| `POST` | `/v1/audio/analyze` | то же + `model` (имя LLM-сервиса из `/v1/services`), `report_lang` (`uz`\|`ru`\|`en`\|`auto`). Результат: транскрипт + `analysis.json` |
+| `POST` | `/v1/audio/report` | то же + `report_format` (`pdf`\|`docx`, по умолчанию `pdf`). Результат: транскрипт + анализ + файл отчёта |
+| `POST` | `/v1/audio/{document_id}/report` | JSON `{"model", "report_format", "report_lang", "title", "speaker_names", "regenerate_analysis"}` — перестроить отчёт (и при необходимости анализ) по уже готовому транскрипту (`document_id` транскрипта) без повторного распознавания. Ответ `202 {"task_id"}` |
+| `GET` | `/v1/audio/tasks/{task_id}` | прогресс (см. ниже). `404`, если задача неизвестна или истёк TTL |
+| `GET` | `/v1/audio/{document_id}` | `DocumentResponse` с presigned `url` |
+| `GET` | `/v1/services?operation=&language=` | `[{"name": "glm-5.3"}]` — LLM-сервисы из БД (sqladmin), как в doc-proc |
+| `GET` | `/v1/languages?service=` | `[{"language_code": "ru"}, …]` |
+| `GET` | `/v1/operations` | `[{"operation_name": "transcribe"}, …]` |
+
+- Аутентификация: `X-API-Key` (`BACKEND_ADMIN_API_KEY`) на весь `/v1`, `compare_digest`, `401` без ключа. `/admin` — sqladmin по логину/паролю.
+- Лимит размера — `BACKEND_MAX_FILE_SIZE_MB` (500); длительность — `AUDIO_MAX_DURATION_SEC` (7200). Превышение → `413` / `400`.
+- Ошибки всегда `{"detail": "..."}` (или список валидации FastAPI) — ARK разбирает именно это.
+- Колбэков нет. ARK опрашивает прогресс каждые 4 с и прекращает через 3 ч.
+
+### 6.1 Прогресс (`GET /v1/audio/tasks/{task_id}`)
+
+Ключ Redis-JSON `task_progress:{task_id}`, TTL `REDIS_PROGRES_TTL` ставится на терминальном статусе.
+
+```jsonc
+{
+  "task_id": "uuid",
+  "status": "pending | processing | complete | error",
+  "created_at": "iso", "started_at": "iso", "completed_at": "iso",
+  "stage": "ingest | diarization | langid | asr | assemble | analysis | report",
+  "total_stages": 4, "current_stage": 3,      // число стадий зависит от операции
+  "total": 12, "current": 7,                  // внутри стадии (батчи ASR, куски map-reduce)
+  "details": "текст ошибки",                  // только при error
+  "warnings": ["speaker_count_low"],          // необязательно
+  "processed_document": { "id": 12, "name": "meeting_transcript.json", "url": "https://…", "object_key": "…", "operation_name": "transcribe", … },
+  "documents": {                              // все результаты задачи; ARK сохраняет каждый
+    "transcript": { "id": 12, "name": "…json", "url": "…" },
+    "analysis":   { "id": 13, "name": "…json", "url": "…" },   // если запрашивался
+    "report":     { "id": 14, "name": "…pdf",  "url": "…" }    // если запрашивался
+  }
+}
+```
+
+`processed_document` — главный результат операции: для `transcribe` транскрипт, для `analyze` анализ, для `report` файл отчёта. Все файлы никогда не пустые (ARK считает нулевой размер ошибкой).
+
+### 6.2 Где что хранится
+
+- **MinIO** (бакет `audio-processor`): `audio/{YYYY-MM-DD}/{uuid}/{safe_name}` — исходник, `transcript.json`, `analysis.json`, `report.pdf|docx`. Presigned-ссылки переписываются на `S3_EXTERNAL_URL`, срок `S3_EXPIRES_IN`.
+- **Postgres** (`documents`): id, name, object_key, parent_id (результаты ссылаются на исходник), language_code, service_name, operation_name, usage (токены LLM, тайминги). Таблица `services` — LLM-сервисы (name, base_url, api_key, model_name, reasoning_effort, limit_requests, max_input_tokens, chunk_tokens, языки, операции).
+- **Redis Stack**: очередь arq + прогресс. Эфемерно.
+- Локальный диск воркера — только `tmp` на время задачи, чистится в `finally`.
+
+### 6.3 Воркеры
+
+- arq, `max_jobs = 1` на процесс (одна задача на воркер, модели в памяти). Масштабирование — числом процессов `backend-worker`.
+- Модели (диаризация, LID) грузятся в `on_startup` воркера один раз.
+- `ARQ_JOB_TIMEOUT` — 3600 с, `ARQ_MAX_TRIES` — 1 (повтор распознавания стоит дорого; ARK перезапускает задачу явно).
+- Heartbeat `worker:{id}` (TTL 30 с) для `/health/deep`.
+
+---
+
+## 7. Схема итогового JSON
+
+```json
+{
+  "job_id": "3f9c...",
+  "audio": {
+    "filename": "meeting.m4a",
+    "duration_sec": 1834.2,
+    "sample_rate": 16000
+  },
+  "speakers": [
+    {
+      "id": "SPEAKER_00",
+      "language": "uz",
+      "lang_confidence": 0.97,
+      "total_speech_sec": 214.3,
+      "segments_count": 18
+    },
+    {
+      "id": "SPEAKER_01",
+      "language": "ru",
+      "lang_confidence": 0.99,
+      "total_speech_sec": 180.1,
+      "segments_count": 12
+    }
+  ],
+  "segments": [
+    {
+      "id": 0,
+      "speaker": "SPEAKER_00",
+      "language": "uz",
+      "start": 12.40,
+      "end": 18.92,
+      "overlap": false,
+      "overlap_with": [],
+      "text": "Bugun biz loyihaning ikkinchi bosqichini boshlaymiz.",
+      "words": null
+    },
+    {
+      "id": 1,
+      "speaker": "SPEAKER_01",
+      "language": "ru",
+      "start": 19.10,
+      "end": 24.05,
+      "overlap": true,
+      "overlap_with": ["SPEAKER_03"],
+      "text": "Согласен, но сроки нужно пересмотреть.",
+      "words": [
+        {"word": "Согласен", "start": 19.10, "end": 19.62}
+      ]
+    }
+  ],
+  "meta": {
+    "pipeline_version": "1.0.0",
+    "models": {
+      "diarization": "pyannote/speaker-diarization-community-1",
+      "langid": "speechbrain/lang-id-voxlingua107-ecapa",
+      "asr": {"uz": "nvidia/stt_uz_fastconformer_hybrid_large_pc", "ru": "gigaam-v3-e2e-rnnt", "en": "nvidia/parakeet-tdt-0.6b-v2"},
+      "asr_backend": "remote_api"
+    },
+    "timings_sec": {"ingest": 2.1, "diarization": 95.4, "langid": 3.2, "asr": 41.0, "total": 142.0},
+    "config": {"min_speakers": 1, "max_speakers": 15, "lid_min_confidence": 0.6}
+  }
+}
+```
+
+`words` — `null`, пока ASR-бэкенд не отдаёт пословные таймкоды (см. M7).
+
+### 7.1 Схема `analysis.json`
+
+Возвращается отдельно (`GET /jobs/{id}/analysis`) и вкладывается в `/result` как поле `analysis`. Все текстовые поля — на `report_lang`. `segment_ids` ссылаются на `segments[].id` транскрипта.
+
+```json
+{
+  "report_lang": "ru",
+  "title": "Планёрка по запуску второго этапа",
+  "summary": "Команда обсудила сроки второго этапа проекта. Основное разногласие — ...",
+  "topics": [
+    {
+      "name": "Сроки второго этапа",
+      "summary": "SPEAKER_00 предложил начать сразу, SPEAKER_01 настаивал на пересмотре сроков ...",
+      "segment_ids": [0, 1, 4, 7]
+    }
+  ],
+  "decisions": [
+    {
+      "text": "Второй этап стартует в понедельник, сроки пересматриваются на следующей неделе",
+      "speaker": "SPEAKER_00",
+      "segment_ids": [14]
+    }
+  ],
+  "action_items": [
+    {
+      "text": "Подготовить обновлённый график этапа",
+      "assignee": "SPEAKER_01",
+      "due": "к пятнице",
+      "segment_ids": [15]
+    }
+  ],
+  "speakers": [
+    {
+      "id": "SPEAKER_00",
+      "role_hint": "ведущий встречи / руководитель проекта",
+      "position": "Настаивает на немедленном старте, готов пересмотреть сроки позже",
+      "key_quotes": [
+        {"segment_id": 0, "original": "Bugun biz loyihaning ikkinchi bosqichini boshlaymiz.", "translated": "Сегодня мы начинаем второй этап проекта."}
+      ]
+    }
+  ],
+  "open_questions": ["Не определено, кто отвечает за бюджет второго этапа"],
+  "stats": {
+    "total_speech_sec": 1650.4,
+    "speakers_count": 5,
+    "segments_count": 212,
+    "overlap_segments": 19,
+    "by_speaker": [{"id": "SPEAKER_00", "speech_sec": 614.2, "share": 0.37, "segments": 71}],
+    "by_language": [{"language": "uz", "speech_sec": 980.1, "share": 0.59}, {"language": "ru", "speech_sec": 670.3, "share": 0.41}]
+  },
+  "meta": {
+    "llm": "claude-…",
+    "prompt_version": "1.0",
+    "input_tokens": 41230,
+    "output_tokens": 2810,
+    "chunked": false
+  }
+}
+```
+
+`role_hint`, `due` — только если это явно следует из транскрипта, иначе `null`. `stats` считается кодом (§5.8 п.7), не LLM.
+
+---
+
+## 8. Этапы (milestones) и критерии приёмки
+
+Делать строго по порядку; каждый этап — отдельный PR/коммит с работающими тестами.
+
+**M0 — Каркас.** Репо, pyproject, config, Dockerfile, docker-compose (api + redis + minio + worker), `JobStore` на Redis, `ObjectStore` на S3, `/health`. Критерий: `docker compose up --scale worker=2` поднимается, `/health` показывает 2 живых воркера, Redis и доступный бакет; `POST /jobs` с пустой заглушкой-пайплайном проходит `queued → running → done`, при этом `input` и `result.json` появляются в бакете, а во временной директории воркера после завершения пусто.
+
+**M1 — Ingest + Diarization.** CLI-скрипт `python -m app.pipeline.run --audio x.wav --stop-after diarize` печатает turns. Критерий: на тестовой записи с известным числом спикеров pyannote находит их ±1.
+
+**M2 — Segment builder.** Unit-тесты на склейку/фильтр/разрезание/overlap. Критерий: тесты зелёные; на реальной записи нет сегментов > 30 с и < 0.4 с.
+
+**M3 — LID.** Критерий: на 10 тестовых спикерах (по 3+ каждого языка) язык определён верно ≥ 9/10.
+
+**M4 — ASR через существующий API.** `remote_api.py`, ретраи, семафор. Критерий: сегмент любого языка возвращает текст; 5xx не роняет job.
+
+**M5 — Router + Assembler + Job API.** Полный `POST /jobs → GET /result`. Критерий: часовая запись на 10 спикеров обрабатывается end-to-end без ошибок, JSON валиден по Pydantic-схеме.
+
+**M6 — Eval harness.** Собрать 5 реальных записей (по 20–40 мин) с ручной разметкой: спикеры+таймкоды (для DER), язык каждого спикера, эталонный текст хотя бы 5 минут на каждый язык. Скрипты `eval_der.py`, `eval_lid.py`, `eval_wer.py`. Критерий: есть таблица метрик в README. Это **база для всех дальнейших решений** по моделям.
+
+**M7 (опц.) — Пословные таймкоды.** Два пути на выбор заказчика:
+  - (a) расширить существующий ASR-API параметром `timestamps=word`: GigaAM v3 RNNT и Parakeet TDT отдают word timestamps нативно, NeMo hybrid — через `transcribe(..., timestamps=True)`; тогда `remote_api.py` просто парсит `words`;
+  - (b) не трогать API — оставить `words: null`.
+  Рекомендуется (a), если есть доступ к коду ASR-сервера.
+
+**M8 (опц.) — Локальные модели.** Реализовать `local_nemo.py` (NeMo для uz/en, `gigaam` пакет для ru), переключение через `asr.backend: local`. Делать только если внешний API станет узким местом или eval покажет, что нужна другая узбекская модель (кандидаты для сравнения: `ai-sage/GigaAM-Multilingual` large_ctc, `rustam1221/uzbek-asr-gigaam`).
+
+**M9 — Analysis.** `LlmClient` (openai_compatible для GLM-5.3), промпты для ru/uz/en, Pydantic-схема §7.1, `stats` кодом, map-reduce для длинных, сохранение `analysis.json`, эндпоинт `GET /analysis`, поле `analysis` в `/result`. Критерий: на 5 eval-записях из M6 анализ на каждом из трёх `report_lang` — резюме верно по смыслу (ручная проверка, **особое внимание узбекскому**), все `decisions`/`action_items` имеют `segment_ids`, указывающие на реплики, где это действительно прозвучало; при недоступном LLM транскрипт всё равно `done` с warning. Замерить время и токены одного анализа при `reasoning_effort: low` — это войдёт в оценку стоимости для заказчика.
+
+**M10 — Report.** Шаблоны `report_{ru,uz,en}.docx`, `build.py`, `charts.py`, LibreOffice в образе, шрифты, `GET /report`, `POST /jobs/{id}/report`, `speaker_names`. Критерий: для одной записи получены `report.pdf` и `report.docx`, открываются в Word/Acrobat, узбекские `oʻ gʻ ʻ` и кириллица отображаются, диаграммы на месте, транскрипт на 2 часа помещается (таблица разбивается по страницам), перегенерация с `speaker_names` подставляет имена везде.
+
+---
+
+### Статус на 2026-09-20
+
+Сделано: M0 (каркас как у doc-proc, Docker, API, воркер, прогресс), M1–M2 (ingest, диаризация pyannote/simple, сегменты + тесты),
+M3 (LID по спикеру), M4 (клиент ASR-API + mock), M5 (router, assembler, полный `POST → tasks/{id}`), M9 (анализ через
+OpenAI-совместимый GLM-5.3, map-reduce, stats кодом, промпты ru/uz/en), M10 (отчёт docx/pdf, перестроение с именами спикеров),
+плюс сторона ARK (`apps/audioproc`, страница `/audio`, админ-настройки). Проверено сквозным прогоном ARK → audio-proc → ARK на
+синтетической записи (ru + en) с mock-ASR и фейковой GLM.
+
+Не сделано: M6 (eval-набор реальных записей и метрики DER/LID/WER — нужны записи от заказчика), M7 (пословные таймкоды),
+M8 (локальные модели ASR). Проверено на реальных ASR-API (`stt.robot-guide.iccu.uz`, ru/en) и реальной GLM-5.3-NVFP4 (`llm.int.glob.uz`, анализ на ru/uz/en). Узбекский ASR на реальной речи ещё не проверялся — нет тестовой записи.
+
+## 9. Конфигурация (`.env`, pydantic-settings, как в doc-proc)
+
+Все настройки — через env с префиксами (`BACKEND_`, `POSTGRES_`, `REDIS_`, `S3_`, `ARQ_`, `CORS_`, `AUDIO_`, `ASR_`, `DIARIZATION_`, `LANGID_`, `ANALYSIS_`, `REPORT_`). `config.yaml` нет.
+
+```env
+# --- как в doc-proc ---
+POSTGRES_HOST=db  POSTGRES_BACKEND_USER=backend_user  POSTGRES_BACKEND_DB=backend_db  POSTGRES_BACKEND_MIGRATOR_USER=backend_migrator …
+REDIS_HOST=redis  REDIS_PORT=6379  REDIS_PASSWORD=…  REDIS_PROGRES_TTL=86400
+BACKEND_ADMIN_USER=admin  BACKEND_ADMIN_PASSWORD=…  BACKEND_ADMIN_API_KEY=…  BACKEND_ADMIN_SECRET_KEY=…
+BACKEND_MAX_FILE_SIZE_MB=500  BACKEND_HOST_PORT=8100
+MINIO_ROOT_USER=…  MINIO_ROOT_PASSWORD=…  MINIO_HOST_PORT=9200  MINIO_CONSOLE_HOST_PORT=9201
+S3_ENDPOINT_URL=http://minio:9000  S3_EXTERNAL_URL=http://localhost:9200  S3_STORAGE_BUCKET=audio-processor  S3_ACCESS_KEY=…  S3_SECRET_KEY=…  S3_EXPIRES_IN=86400
+ARQ_MAX_WORKERS=1  ARQ_JOB_TIMEOUT=3600  ARQ_MAX_TRIES=1
+
+# --- аудио-пайплайн ---
+AUDIO_MAX_DURATION_SEC=7200
+AUDIO_TMP_DIR=/tmp/audio-proc
+AUDIO_DEVICE=cpu                      # cpu | cuda | mps
+AUDIO_HF_TOKEN=                       # нужен только для DIARIZATION_BACKEND=pyannote
+AUDIO_KEEP_WAV=false
+
+DIARIZATION_BACKEND=simple            # pyannote | simple
+DIARIZATION_MODEL=pyannote/speaker-diarization-community-1
+DIARIZATION_MIN_SPEAKERS=1
+DIARIZATION_MAX_SPEAKERS=15
+# simple-бэкенд:
+DIARIZATION_EMBEDDING_MODEL=speechbrain/spkrec-ecapa-voxceleb
+DIARIZATION_CLUSTER_THRESHOLD=0.7
+
+SEGMENTS_MERGE_GAP_SEC=0.5  SEGMENTS_MIN_SEGMENT_SEC=0.4  SEGMENTS_MAX_SEGMENT_SEC=28.0  SEGMENTS_OVERLAP_MIN_SEC=0.3  SEGMENTS_PAD_SEC=0.15
+
+LANGID_MODEL=speechbrain/lang-id-voxlingua107-ecapa
+LANGID_ALLOWED=["uz","ru","en"]
+LANGID_AUDIO_SEC=20  LANGID_MIN_AUDIO_SEC=2  LANGID_MIN_CONFIDENCE=0.6
+LANGID_PER_SEGMENT_RECHECK=false  LANGID_RECHECK_MIN_SEGMENT_SEC=4.0  LANGID_RECHECK_MIN_CONFIDENCE=0.9
+
+ASR_BACKEND=remote                    # remote | mock
+ASR_API_URL=https://stt.robot-guide.iccu.uz/api/v1/asr/transcribe
+ASR_FILE_FIELD=file  ASR_LANG_FIELD=language_code  ASR_TEXT_FIELD=transcription
+ASR_CONCURRENCY=4  ASR_TIMEOUT_SEC=60  ASR_RETRIES=3
+
+# LLM-сервисы (GLM-5.3) заводятся в /admin → Services; здесь только лимиты по умолчанию
+ANALYSIS_MAX_INPUT_TOKENS=40000       # контекст локальной GLM-5.3 — 120k
+ANALYSIS_CHUNK_TOKENS=30000
+ANALYSIS_MAX_OUTPUT_TOKENS=8000
+ANALYSIS_TIMEOUT_SEC=300  ANALYSIS_RETRIES=3
+ANALYSIS_DEFAULT_REPORT_LANG=auto
+
+REPORT_LIBREOFFICE_BIN=soffice
+REPORT_INCLUDE_FULL_TRANSCRIPT=true
+WITH_LIBREOFFICE=1                    # сборка образа воркера с LibreOffice (для PDF)
+```
+
+Запись `Service` в БД (sqladmin): `name` (напр. `glm-5.3`), `provider=openai_compatible`, `base_url` (`http://<glm-host>:8000/v1`), `api_key`, `model_name`, `reasoning_effort=low`, `use_json_schema=false`, `limit_requests` (семафор), `max_input_tokens`/`chunk_tokens` (переопределяют ANALYSIS_*), языки, операции.
+
+### docker-compose
+
+Три файла как в doc-proc: `docker-compose.yml` (db, redis), `docker-compose.dev.yml` (+ minio, setup-minio, backend-api с `--reload`, backend-worker, backend-migrate), `docker-compose.prod.yml` (prod-цели, nginx). Образ воркера собирается с `ffmpeg`, `libreoffice-writer`, `fonts-noto-core`, `fonts-dejavu`. GPU в prod — `deploy.resources.reservations.devices` для `backend-worker`. Модели HF кэшируются в volume `hf-cache`.
+
+---
+
+## 10. Обработка ошибок и крайние случаи
+
+- Diarization нашла 1 спикера на файле, где ожидалось 10 → job всё равно `done`, но `meta.warnings: ["speaker_count_low"]`.
+- ASR API недоступен → после ретраев job `failed` с понятной ошибкой; частичные результаты не отдавать.
+- Спикер с < 2 с речи → язык = `lid_fallback` (язык большинства), `lang_confidence: 0.0`, warning.
+- Тишина/музыка без речи → `segments: []`, `speakers: []`, статус `done`.
+- ASR вернул пустой текст на ≥ 50% реплик (тихая/дальняя/зашумлённая запись — так было с реальной записью 2026-09-20: узбекская NeMo-модель молчит, хотя на чистом FLEURS распознаёт дословно) → `done`, warning `asr_mostly_empty`.
+- Стерео-запись с разными людьми в каналах → в v1 сводится в моно (ffmpeg); зафиксировать как известное ограничение.
+- S3 недоступен при загрузке → api отвечает `503`, job не создаётся. S3 недоступен у воркера → ретрай 3 раза, затем `failed`; временные файлы удаляются.
+- Redis перезапустился с потерей данных → незавершённые job'ы «зависают» в глазах клиента (`404` на статус). Объекты в S3 остаются; повторная отправка того же файла — новый job. Это принятое ограничение v1; при необходимости позже — восстановление статусов из `meta.json`.
+- Временные файлы воркера удаляются в `finally` независимо от исхода.
+- LLM недоступен / вернул невалидный JSON дважды → транскрипт сохраняется и job `done`, `analysis: null`, `report` не строится, `meta.warnings: ["analysis_failed"]`. Клиент может позже вызвать `POST /jobs/{id}/report` с `regenerate_analysis: true`.
+- LibreOffice упал при конвертации в PDF → `report.docx` всё равно сохраняется, warning `pdf_failed`.
+- Транскрипт пустой (нет речи) → анализ не запускается, `analysis: null`, warning `no_speech`.
+
+---
+
+## 11. Что нужно уточнить у заказчика (статус на 2026-09-20)
+
+Закрыто: п.1–3 (ASR-API = `stt.robot-guide.iccu.uz/api/v1/asr/transcribe`, multipart `file`+`language_code` [+ опц. `provider`], ответ `{transcription, provider, language_code}`, wav 16k mono ≤ 30 с, батча нет; ru → gigaam, en → nemo), п.8 (колбэк не нужен — ARK опрашивает), п.10 (GLM-5.3-NVFP4 через шлюз Bifrost `llm.int.glob.uz/openai/v1`, провайдер SGLang, контекст 120k; `/v1/models` на шлюзе не работает — проверять соединение chat-запросом). Открыто: п.4–7, 9, 11, 12 и лимит параллельных запросов к GLM.
+
+1. Точный URL и метод ASR-API; формат запроса (multipart? JSON+base64?); имена полей `lang` и аудио; формат ответа (где лежит текст).
+2. Какой аудиоформат ждёт API (wav 16k mono — предположение). Максимальная длина куска.
+3. Есть ли батч-эндпоинт и ограничение на параллельные запросы.
+4. Есть ли доступ к коду ASR-сервера (для M7a — пословные таймкоды).
+5. HF-токен с принятыми условиями для `pyannote/speaker-diarization-community-1`.
+6. Характеристики STT-сервера (модель GPU, VRAM) — от этого зависит число воркеров (§13).
+7. Лимит одновременных запросов к ASR-API — от этого зависит `asr.concurrency` × число воркеров.
+8. Нужен ли `callback_url` проекту заказчика, или он будет опрашивать статус.
+9. MinIO/S3: endpoint, бакет, ключи доступа, сколько нужно хранить результаты (для lifecycle-правила), и будет ли клиент забирать результаты напрямую по presigned URL.
+10. GLM-5.3 у заказчика: URL эндпоинта, имя модели в `/v1/models`, ключ; полная GLM-5.3 или GLM-5.3-Flash; чем поднята (vLLM / SGLang) — от этого зависит, как передавать `reasoning_effort` и приходит ли reasoning отдельным полем; лимит параллельных запросов (воркеры будут ходить одновременно).
+11. Отчёт: есть ли фирменный шаблон/бренд-бук (логотип, шрифты, цвета) — нужен для `.docx`-шаблонов; кто его готовит.
+12. На каком языке отчёт по умолчанию, если клиент не указал: авто (язык большинства) или всегда фиксированный (например, русский).
+
+---
+
+## 12. Ожидаемая производительность (ориентир)
+
+На одной современной GPU: диаризация ≈ 1–3% от длительности записи (час аудио → 1–2 мин), LID — секунды, ASR — зависит от внешнего API и параллелизма. Часовая запись end-to-end: **2–5 минут** на один воркер. N воркеров дают почти линейный рост пропускной способности, пока не упрётся в VRAM или в лимит ASR-API. Если медленнее в 3+ раза — профилировать `meta.timings_sec`.
+
+---
+
+## 13. Требования к STT-серверу (отдельная машина)
+
+На этом сервере работают только `api`, `worker`×N и `redis`. Постоянные данные лежат в MinIO/S3 (свой сервер или внешний сервис), ASR-API заказчика живёт на своём сервере и **не изменяется** — к нему идут HTTP-запросы по внутренней сети.
+
+### Железо
+
+| Ресурс | Минимум | Рекомендуется |
+|---|---|---|
+| GPU | NVIDIA, 4 ГБ VRAM (1 воркер) | 8–16 ГБ VRAM (2–4 воркера): T4, RTX 3060/4060, A10, L4 |
+| RAM | 16 ГБ | 32 ГБ при 3+ воркерах (каждый держит запись целиком в памяти) |
+| CPU | 4 ядра | 8 ядер (ffmpeg и нарезка — на CPU, по одному job'у на воркер) |
+| Диск | 15 ГБ | 30 ГБ SSD: модели ~3 ГБ, torch/CUDA ~5 ГБ, временный кэш воркеров (~150 МБ на час аудио × воркеры). Постоянных данных на диске нет — всё в S3 |
+
+Без GPU всё запускается, но диаризация на CPU в 10–20 раз медленнее (час записи → 30–60 мин). Годится только для разработки.
+
+Расчёт числа воркеров: `floor(VRAM_ГБ / 3)`, ограниченный сверху лимитом параллельности ASR-API (`workers × asr.concurrency ≤ лимит API`).
+
+### MinIO / S3
+
+- Бакет `stt` (имя — в конфиге), доступ по access/secret key с правами `GetObject/PutObject/DeleteObject/ListBucket` на этот бакет.
+- Lifecycle-правило на префикс `jobs/` с истечением через `job_ttl_hours` (или дольше — по требованию заказчика к хранению результатов).
+- Сетевой доступ к MinIO и с STT-сервера (api + воркеры), и, если используется `?presigned=true`, — с серверов проекта заказчика.
+- Пропускная способность: воркер скачивает исходник (до 500 МБ) в начале job'а и загружает результат в конце — на внутренней сети 1 Гбит это секунды.
+
+### ОС и системное ПО
+
+- Ubuntu 22.04 / 24.04.
+- NVIDIA-драйвер 535+. CUDA Toolkit отдельно не нужен — `torch` из pip несёт свой рантайм.
+- Docker + `nvidia-container-toolkit` (рекомендуемый способ запуска), либо bare-metal: Python 3.11, `ffmpeg`, Redis 7.
+- В образе воркера дополнительно: `libreoffice-writer` (headless, ~400 МБ) и шрифты `fonts-noto-core`, `fonts-dejavu` — для отчётов. Образ воркера получается ~8–9 ГБ; это нормально.
+- Исходящий доступ к эндпоинту GLM-5.3 заказчика с воркеров (внутренняя сеть).
+- Redis с `appendonly yes`, чтобы очередь пережила перезапуск. Это не постоянное хранилище — только чтобы не терять job'ы, стоящие в очереди в момент рестарта.
+
+### Доступы
+
+- Аккаунт Hugging Face + токен (`HF_TOKEN`). На странице `pyannote/speaker-diarization-community-1` один раз принять условия использования под этим аккаунтом — модель gated, без этого загрузка падает с 401/403. LID-модель speechbrain не gated.
+- Исходящий доступ к `huggingface.co` при первом запуске (модели кэшируются в volume `hf-cache`, общий для всех воркеров). После прогрева можно выставить `HF_HUB_OFFLINE=1`.
+- Исходящий доступ с STT-сервера к ASR-API (внутренняя сеть / VPN).
+- Входящий порт `api` (8000) открыт только для серверов проекта заказчика; сверху `X-API-Key`.
+- Проверить лицензию модели pyannote под сценарий использования на её странице.
+
+### Что должен выдерживать ASR-API (без изменений в нём)
+
+- Куски аудио до 30 с, wav 16 kHz mono PCM16 (если ждёт другой формат — указать в `asr.remote_api`).
+- `workers × asr.concurrency` одновременных запросов (по умолчанию 3 воркера × 4 = 12). Если лимит ниже — уменьшить `asr.concurrency`.
+- Ответ в пределах `asr.timeout_sec` (60 с).
+
+### Проверка готовности окружения (до кода)
+
+1. `nvidia-smi` в контейнере/на хосте показывает GPU.
+2. Скрипт на 10 строк: `Pipeline.from_pretrained(..., token=HF_TOKEN).to("cuda")` → прогнать 5-минутный wav → распечатать turns. Отработало — окружение готово.
+3. `curl` на ASR-API с 10-секундным wav каждого языка — зафиксировать реальный формат запроса/ответа для `remote_api.py`.
+4. `redis-cli ping` → `PONG`; `mc ls <alias>/stt` (или `aws s3 ls`) — бакет доступен с ключами из `.env`.
+
+---
+
+## 14. Контракт для ARK (клиентская сторона)
+
+ARK общается только с `backend-api` аудио-сервиса по HTTP(S) с `X-API-Key`; про Redis, воркеры, ASR-API и GLM он не знает. Исключение — presigned-ссылки на MinIO, по которым ARK скачивает результаты (в dev через `AUDIOPROC_LOCALHOST_ALIAS`, как `DOCPROC_LOCALHOST_ALIAS`).
+
+**ark-backend, `apps/audioproc`** — копия `apps/docproc`:
+- `AudioProcSettings` (singleton): `base_url`, `api_key`, `max_file_size_mb`, `max_concurrent_per_user`, `retention_days`, `default_analyze_model`, `default_report_format`, `default_report_lang`, `last_check_*`.
+- `AudioProcTask`: `operation` ∈ {`transcribe`, `analyze`, `report`}, `source_file` (StoredFile из storage), параметры (`expected_speakers`, `report_lang`, `report_format`, `model`, `speaker_names` JSON, `title`), статусы `pending/processing/completed/error/cancelled/expired`, `progress` JSON, `upstream_task_id`, `transcript_file`/`analysis_file`/`result_file` (StoredFile), `transcript_preview`, тайминги.
+- `client.py` (`health`, `services`, `languages`, `start`, `progress`, `document`, `download`), `services.py` (`submit`, `poll`, `complete` — копирует все `documents` из ответа прогресса в бакет ARK, `notify`), `tasks.py` (Celery `submit_audioproc_task`, самоперепланирующийся `poll_audioproc_task` раз в 4 с, `expire_audioproc_results` в beat).
+- Права `audioproc:use`, пункты меню `/documents/audio` (внутри раздела «Documents») и `/admin-info/audioproc`, `Notification.RouteType.AUDIOPROC`, `register_access_check("audioproc", …)`.
+- Загрузка файла — через существующий presign-flow storage (`audio/*` MIME уже разрешены), задача ссылается на `file_id`.
+
+**ark-frontend**: `api/endpoints/audioproc.ts`, `types/audioproc.ts`, страница `pages/documents/audio/` (панель запуска: файл, операция, язык отчёта, формат, ожидаемое число спикеров; список задач с прогрессом по стадиям; просмотр транскрипта по спикерам с таймкодами; скачивание JSON/PDF/DOCX), `pages/admin/audioproc/AudioProcSettingsPage.tsx`, роуты, меню, `queryKeys.audioproc`, i18n ru/uz/en, инвалидация по bus-событию `RouteType.AudioProc`.
+
+Время обработки для UI: транскрипт 2–5 мин на час аудио на GPU (на CPU в 10–20 раз дольше), анализ +1–5 мин (GLM-5.3, map-reduce), отчёт +10–30 с. Показывать `stage` из прогресса.
+
+Ошибки: `401` (ключ), `413` (файл слишком большой), `400` (неподдерживаемый формат/длительность/параметры), `404` (задача истекла), `503` (сервис не сконфигурирован).

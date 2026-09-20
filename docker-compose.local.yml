@@ -1,0 +1,16 @@
+# Разработка на Mac без сборки тяжёлого образа воркера: в Docker — только
+# db, redis, minio (порты наружу), а api и worker запускаются нативно через uv:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.local.yml up -d db redis minio setup-minio
+#   cd backend && cp ../.env .env  (и поправить POSTGRES_HOST/REDIS_HOST/S3_ENDPOINT_URL на localhost, см. README)
+#   uv run alembic upgrade head
+#   uv run uvicorn app.main:app --port 8100 --reload
+#   uv run arq app.workers.arq_worker.WorkerSettings
+name: audio-processor
+
+services:
+  db:
+    ports:
+      - "${POSTGRES_HOST_PORT:-5440}:5432"
+  redis:
+    ports:
+      - "${REDIS_HOST_PORT:-6390}:6379"
