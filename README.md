@@ -92,6 +92,20 @@ cd backend && uv run pytest            # или sh scripts/run.sh test
 Тестовая запись на двух спикерах (ru + en) генерируется macOS TTS: см. `eval/data/` (не в git);
 `say -v Milena … ; say -v Samantha … ; ffmpeg … concat`.
 
+## Prod (сервер)
+
+```sh
+sh scripts/run.sh up   # docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+- Снаружи стоит хостовый nginx сервера (:80, конфиг `~/nginx-host/` на сервере): он проксирует
+  `/audio-proc/` → nginx проекта на `127.0.0.1:${NGINX_HTTP_HOST_PORT}` (8081). Наружу порт проекта не публикуется.
+- Префикс срезается на хосте, приложение получает его через `UVICORN_ROOT_PATH` (= `API_ROOT_PATH` из `.env`):
+  API — `http://<host>/audio-proc/docs`, админка — `http://<host>/audio-proc/admin`. Свой домен с корня — `API_ROOT_PATH=`.
+- MinIO публикуется напрямую на `${MINIO_HOST_PORT}` (9200): presigned-ссылки через префикс не работают
+  (подпись S3 включает путь и Host), поэтому `S3_EXTERNAL_URL=http://<host>:9200`.
+- TLS терминируется на хосте (certbot), контейнерный nginx (`.docker/nginx/`) слушает только HTTP.
+
 ## Конфигурация
 
 Все переменные — в `.env.example` с комментариями. Ключевые:
