@@ -102,8 +102,8 @@ sh scripts/run.sh up   # docker compose -f docker-compose.yml -f docker-compose.
   `/audio-proc/` → nginx проекта на `127.0.0.1:${NGINX_HTTP_HOST_PORT}` (8081). Наружу порт проекта не публикуется.
 - Префикс срезается на хосте, приложение получает его через `UVICORN_ROOT_PATH` (= `API_ROOT_PATH` из `.env`):
   API — `http://<host>/audio-proc/docs`, админка — `http://<host>/audio-proc/admin`. Свой домен с корня — `API_ROOT_PATH=`.
-- MinIO публикуется напрямую на `${MINIO_HOST_PORT}` (9200): presigned-ссылки через префикс не работают
-  (подпись S3 включает путь и Host), поэтому `S3_EXTERNAL_URL=http://<host>:9200`.
+- Хранилище — внешнее S3 (`S3_ENDPOINT_URL`, `S3_EXTERNAL_URL`, ключи, бакет в `.env`); MinIO в prod-compose
+  не входит. Нужен локальный MinIO — `sh scripts/run.sh --with-minio up` (добавляет `docker-compose.minio.yml`).
 - TLS терминируется на хосте (certbot), контейнерный nginx (`.docker/nginx/`) слушает только HTTP.
 
 ## Конфигурация

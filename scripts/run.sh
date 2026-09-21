@@ -4,10 +4,15 @@ set -eu
 COMPOSE="docker compose"
 FILES_DEV="-f docker-compose.yml -f docker-compose.dev.yml"
 FILES_PROD="-f docker-compose.yml -f docker-compose.prod.yml"
+# --with-minio: прод-стек с локальным MinIO вместо внешнего S3
+if [ "${1:-}" = "--with-minio" ]; then
+  FILES_PROD="$FILES_PROD -f docker-compose.minio.yml"
+  shift
+fi
 
 usage() {
   cat >&2 <<USAGE
-Usage: $0 [--with-libreoffice|--without-libreoffice] {up|dev|migrate|rebuild|down|restart|logs|test}
+Usage: $0 [--with-minio] [--with-libreoffice|--without-libreoffice] {up|dev|migrate|rebuild|down|restart|logs|test}
 
   --with-libreoffice     образ с LibreOffice — нужен для PDF-отчётов (по умолчанию, см. WITH_LIBREOFFICE в .env)
   --without-libreoffice  без него: отчёт только в docx

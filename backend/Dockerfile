@@ -17,7 +17,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 # uid/gid 1000 — чтобы updateRemoteUserUID девконтейнера совпал с юзером хоста.
 RUN groupadd --gid 1000 appuser \
     && useradd --uid 1000 --gid 1000 --create-home appuser \
-    && install -d -o appuser -g appuser /opt/venv /app /tmp/audio-proc
+    && install -d -o appuser -g appuser /opt/venv /app /tmp/audio-proc /home/appuser/.cache
 
 # ffmpeg — ingest любого контейнера в wav 16k mono; libsndfile — soundfile;
 # шрифты Noto/DejaVu — кириллица и узбекская латиница (oʻ gʻ) в PDF-отчётах.
@@ -77,7 +77,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 appuser \
     && useradd --uid 1000 --gid 1000 --create-home appuser \
-    && install -d -o appuser -g appuser /tmp/audio-proc
+    # /home/appuser/.cache — точка монтирования тома hf-cache: директория должна
+    # существовать в образе с владельцем appuser, иначе docker создаст её от root
+    # и воркер упадёт с PermissionError при скачивании моделей HF.
+    && install -d -o appuser -g appuser /tmp/audio-proc /home/appuser/.cache
 
 WORKDIR /app
 COPY --from=builder --chown=appuser:appuser /opt/venv /opt/venv

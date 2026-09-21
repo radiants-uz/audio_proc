@@ -1,0 +1,69 @@
+name: audio-processor
+
+# Локальный MinIO для prod-стека (когда внешнего S3 нет):
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.minio.yml up -d
+#   (= sh scripts/run.sh --with-minio up)
+# В .env при этом: S3_ENDPOINT_URL=http://minio:9000, S3_USE_SSL=false,
+# S3_EXTERNAL_URL — адрес, по которому клиенты достают presigned-ссылки.
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z
+    # Наружу только 127.0.0.1 (MINIO_BIND_ADDR=0.0.0.0, если presigned-ссылки
+    # должны открываться с других машин напрямую по этому порту).
+    ports:
+      - "${MINIO_BIND_ADDR:-127.0.0.1}:${MINIO_HOST_PORT:-9200}:9000"
+    volumes:
+      - miniodata:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: always
+    networks:
+      - audio-net
+
+  setup-minio:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_STORAGE_BUCKET: ${S3_STORAGE_BUCKET}
+      S3_ASSETS_BUCKET: ${S3_ASSETS_BUCKET}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_USER: ${S3_USER}
+      S3_USER_PASS: ${S3_USER_PASS}
+    volumes:
+      - ./.docker/minio/policies:/policies
+      - ./.docker/minio/init_minio.sh:/init_minio.sh
+    entrypoint: ["/bin/sh", "/init_minio.sh"]
+    restart: on-failure
+    networks:
+      - audio-net
+
+  backend-api:
+    depends_on:
+      minio:
+        condition: service_healthy
+      setup-minio:
+        condition: service_completed_successfully
+
+  backend-worker:
+    depends_on:
+      minio:
+        condition: service_healthy
+      setup-minio:
+        condition: service_completed_successfully
+
+volumes:
+  miniodata:

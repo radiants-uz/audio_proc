@@ -1,49 +1,10 @@
 name: audio-processor
 
-services:
-  minio:
-    image: quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z
-    # 9000 нужен наружу, чтобы внешний reverse-proxy мог отдавать presigned-ссылки
-    # (S3_EXTERNAL_URL). Консоль (9001) наружу не выставляем.
-    ports:
-      - "${MINIO_HOST_PORT:-9200}:9000"
-    volumes:
-      - miniodata:/data
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    command: server /data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    restart: always
-    networks:
-      - audio-net
+# Prod: хранилище — внешнее S3 (S3_ENDPOINT_URL/S3_EXTERNAL_URL/ключи в .env).
+# MinIO в prod не входит; для прод-стека с локальным MinIO добавьте
+# docker-compose.minio.yml (sh scripts/run.sh --with-minio up).
 
-  setup-minio:
-    image: quay.io/minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_healthy
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      S3_STORAGE_BUCKET: ${S3_STORAGE_BUCKET}
-      S3_ASSETS_BUCKET: ${S3_ASSETS_BUCKET}
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
-      S3_SECRET_KEY: ${S3_SECRET_KEY}
-      S3_USER: ${S3_USER}
-      S3_USER_PASS: ${S3_USER_PASS}
-    volumes:
-      - ./.docker/minio/policies:/policies
-      - ./.docker/minio/init_minio.sh:/init_minio.sh
-    entrypoint: ["/bin/sh", "/init_minio.sh"]
-    restart: on-failure
-    networks:
-      - audio-net
+services:
 
   backend-api:
     build:
@@ -66,10 +27,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio:
-        condition: service_healthy
-      setup-minio:
-        condition: service_completed_successfully
       backend-migrate:
         condition: service_completed_successfully
     healthcheck:
@@ -98,10 +55,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio:
-        condition: service_healthy
-      setup-minio:
-        condition: service_completed_successfully
       backend-migrate:
         condition: service_completed_successfully
     # GPU: раскомментировать на сервере с nvidia-container-toolkit и выставить AUDIO_DEVICE=cuda.
@@ -149,6 +102,5 @@ services:
       - audio-net
 
 volumes:
-  miniodata:
   hf-cache:
   worker-tmp:
