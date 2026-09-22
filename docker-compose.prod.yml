@@ -13,6 +13,9 @@ services:
       args:
         WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-1}
     env_file: .env
+    # stt-server на этом же хосте: ASR_API_URL=http://host.docker.internal:8300/...
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       FORWARDED_ALLOW_IPS: "*"
       # Префикс, под которым API опубликован на хостовом nginx
@@ -47,6 +50,9 @@ services:
         WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-1}
     command: arq app.workers.arq_worker.WorkerSettings
     env_file: .env
+    # stt-server на этом же хосте: ASR_API_URL=http://host.docker.internal:8300/...
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - hf-cache:/home/appuser/.cache
       - worker-tmp:/tmp/audio-proc
