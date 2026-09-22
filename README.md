@@ -18,9 +18,11 @@ audio (любой контейнер) → ffmpeg 16k mono → диаризаци
 
 | Компонент | Реализация | Переключение |
 |---|---|---|
-| Диаризация | `pyannote/speaker-diarization-community-1` (gated, нужен `AUDIO_HF_TOKEN`) или `simple`: silero-VAD + ECAPA-эмбеддинги + кластеризация (без токена) | `DIARIZATION_BACKEND=pyannote\|simple` |
+| Диаризация | **`pyannote/speaker-diarization-community-1`** (по умолчанию; gated, нужен `AUDIO_HF_TOKEN`). `simple` (silero-VAD + ECAPA + кластеризация) — только для разработки без токена | `DIARIZATION_BACKEND=pyannote\|simple` |
 | ASR | `POST https://stt.robot-guide.iccu.uz/api/v1/asr/transcribe` (multipart `file` + `language_code`) или `mock` для разработки | `ASR_BACKEND=remote\|mock` |
 | LLM | любой OpenAI-совместимый эндпоинт (GLM-5.3 через vLLM/SGLang); сервисы заводятся в `/admin` → LLM services | строка `Service` в БД |
+| Улучшение звука | адаптивно перед ASR/LID: тихо → `speechnorm`, шумно → `afftdn`, диаризация по исходнику | `ENHANCE_*` |
+| Спикеры | слияние ложных спикеров по ECAPA-эмбеддингам (мелкие, похожие, `expected_speakers`) | `SPEAKERS_*` |
 | PDF | LibreOffice headless в образе воркера (`WITH_LIBREOFFICE=1`) | без него — только docx + warning `pdf_failed` |
 
 ## Стек
@@ -116,6 +118,18 @@ sh scripts/run.sh up   # docker compose -f docker-compose.yml -f docker-compose.
 - `ASR_BACKEND`, `ASR_API_URL`, `ASR_CONCURRENCY`, `ASR_TIMEOUT_SEC`, `ASR_RETRIES`
 - `ANALYSIS_MAX_INPUT_TOKENS=40000`, `ANALYSIS_CHUNK_TOKENS=30000` (контекст локальной GLM-5.3 — 120k)
 - `ARQ_MAX_WORKERS=1`, `ARQ_JOB_TIMEOUT=3600`, `ARQ_MAX_TRIES=1`
+
+## Замеры диаризации (2026-09-22, Apple M4, CPU)
+
+| Запись | pyannote community-1 | simple |
+|---|---|---|
+| Совещание, дальний микрофон, 403 с | 2 спикера, 237 с | 15 «спикеров», 10 с |
+| Диалог-сценка, 172 с | 2 спикера, 108 с | 14 «спикеров», 4 с |
+| Синтез, 2 голоса, 33 с | 2, 22 с | 2, 1 с |
+
+pyannote на CPU работает примерно в 0.6× реального времени (час записи → ~35 мин) и требует 2–3 ГБ RAM
+сверх загруженных моделей. `simple` быстрый, но на реальных записях дробит голоса на обрывки — для него
+обязательна пост-обработка `SPEAKERS_*`, и всё равно он только для разработки.
 
 ## Известные ограничения v1
 

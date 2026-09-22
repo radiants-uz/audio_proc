@@ -22,10 +22,13 @@ class PyannoteDiarizer:
         token = settings.audio.hf_token.get_secret_value() or None
         if not token:
             raise RuntimeError(
-                "DIARIZATION_BACKEND=pyannote requires AUDIO_HF_TOKEN (gated model on Hugging Face)"
+                "DIARIZATION_BACKEND=pyannote requires AUDIO_HF_TOKEN: create a free Hugging Face "
+                f"account, accept the terms at https://huggingface.co/{self.model_name}, then put a "
+                "read token into AUDIO_HF_TOKEN (or set DIARIZATION_BACKEND=simple for development)"
             )
         self._pipeline = Pipeline.from_pretrained(self.model_name, token=token)
         self._pipeline.to(torch.device(settings.audio.device))
+        self._torch = torch
         logger.info("pyannote pipeline %s loaded on %s", self.model_name, settings.audio.device)
 
     def diarize(self, wav_path: Path, min_speakers: int | None, max_speakers: int | None) -> DiarizationResult:
@@ -35,7 +38,14 @@ class PyannoteDiarizer:
             kwargs["min_speakers"] = min_speakers
         if max_speakers:
             kwargs["max_speakers"] = max_speakers
-        output = self._pipeline(str(wav_path), **kwargs)
+        # Передаём waveform, а не путь: pyannote 4 декодирует файлы через torchcodec,
+        # который требует совместимых библиотек ffmpeg (на Mac с ffmpeg 8 не грузится).
+        # У нас уже есть 16 kHz mono wav — читаем soundfile и отдаём тензор.
+        import soundfile as sf
+
+        data, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
+        waveform = self._torch.from_numpy(data.T.copy())  # (channels, samples)
+        output = self._pipeline({"waveform": waveform, "sample_rate": int(sr)}, **kwargs)
 
         # pyannote 4.x возвращает объект с .speaker_diarization / .exclusive_speaker_diarization,
         # 3.x — Annotation напрямую.

@@ -8,9 +8,11 @@ from .audio import (
     AsrSettings,
     AudioSettings,
     DiarizationSettings,
+    EnhanceSettings,
     LangIdSettings,
     ReportSettings,
     SegmentsSettings,
+    SpeakersSettings,
 )
 from .cors import CorsSettings
 from .database import DBSettings
@@ -33,6 +35,8 @@ class Settings(BaseSettings):
     asr: AsrSettings = AsrSettings()
     analysis: AnalysisSettings = AnalysisSettings()
     report: ReportSettings = ReportSettings()
+    enhance: EnhanceSettings = EnhanceSettings()
+    speakers: SpeakersSettings = SpeakersSettings()
 
     max_file_size_mb: int = 500
 

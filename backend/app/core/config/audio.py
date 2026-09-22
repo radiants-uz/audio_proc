@@ -20,7 +20,9 @@ class AudioSettings(BaseSettings):
 
 
 class DiarizationSettings(BaseSettings):
-    backend: Literal["pyannote", "simple"] = "simple"
+    # pyannote — основной и единственный рекомендуемый бэкенд (нужен AUDIO_HF_TOKEN);
+    # simple — только для разработки без токена, включается явно.
+    backend: Literal["pyannote", "simple"] = "pyannote"
     model: str = "pyannote/speaker-diarization-community-1"
     min_speakers: int = 1
     max_speakers: int = 15
@@ -93,6 +95,50 @@ class AnalysisSettings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="ANALYSIS_", case_sensitive=False, extra="ignore"
+    )
+
+
+class EnhanceSettings(BaseSettings):
+    """Адаптивное улучшение звука перед ASR/LID (app/services/audio_processing/enhance.py)."""
+
+    enabled: bool = True
+    # Тихая запись: средний уровень ниже — включается speechnorm.
+    quiet_db: float = -28.0
+    # Шумная запись: noise floor выше — включается afftdn.
+    noisy_db: float = -45.0
+    denoise_nr: int = 12
+    denoise_nf: int = -35
+    speechnorm_expansion: float = 6.0
+    # Прогонять highpass даже на чистых записях.
+    always_highpass: bool = False
+
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="ENHANCE_", case_sensitive=False, extra="ignore"
+    )
+
+
+class SpeakersSettings(BaseSettings):
+    """Слияние ложных спикеров после диаризации (app/services/audio_processing/speakers.py)."""
+
+    enabled: bool = True
+    min_speech_sec: float = 6.0
+    min_share: float = 0.03
+    # Порог косинусной близости для слияния пар. pyannote даёт чистые кластеры,
+    # там слияние по похожести почти не нужно (0.80). simple дробит один голос на
+    # обрывки с близостью 0.5–0.7 между собой, а чужой голос — 0.1–0.35
+    # (замерено 2026-09-22), поэтому для него порог 0.55.
+    merge_similarity: float = 0.80
+    merge_similarity_simple: float = 0.55
+    min_speakers: int = 1
+
+    @property
+    def similarity_for_backend(self) -> float:
+        from app.core.config import settings  # noqa: PLC0415 — избегаем цикла при импорте
+
+        return self.merge_similarity_simple if settings.diarization.backend == "simple" else self.merge_similarity
+
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="SPEAKERS_", case_sensitive=False, extra="ignore"
     )
 
 

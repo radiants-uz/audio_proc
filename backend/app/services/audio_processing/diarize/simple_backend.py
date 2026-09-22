@@ -16,29 +16,26 @@ from app.services.audio_processing.types import RawTurn
 
 logger = logging.getLogger(__name__)
 
-# На CPU батч из 32 окон считается в десятки раз дольше, чем 4 батча по 8
-# (замерено на Apple M4: 18 с против 0.4 с) — держим батч маленьким.
-EMBED_BATCH = 8
 
 
 class SimpleDiarizer:
-    def __init__(self):
+    def __init__(self, embedder=None):
         self.model_name = f"simple(silero-vad + {settings.diarization.embedding_model})"
         self._vad = None
-        self._encoder = None
+        self._embedder = embedder
 
     def load(self) -> None:
         import torch
         from silero_vad import load_silero_vad
-        from speechbrain.inference.speaker import EncoderClassifier
+
+        from app.services.audio_processing.embedder import SpeakerEmbedder
 
         self._vad = load_silero_vad()
+        if self._embedder is None:
+            self._embedder = SpeakerEmbedder()
+            self._embedder.load()
         # silero_vad выставляет torch.set_num_threads(1) на весь процесс — возвращаем.
         torch.set_num_threads(max(1, min(8, os.cpu_count() or 1)))
-        self._encoder = EncoderClassifier.from_hparams(
-            source=settings.diarization.embedding_model,
-            run_opts={"device": settings.audio.device if settings.audio.device != "mps" else "cpu"},
-        )
         self._torch = torch
         logger.info("simple diarizer loaded (%s)", self.model_name)
 
@@ -69,36 +66,7 @@ class SimpleDiarizer:
         return out
 
     def _embed(self, audio: np.ndarray, windows: list[tuple[float, float]]) -> np.ndarray:
-        embs = []
-        batch = []
-        maxlen = int(settings.diarization.window_sec * SAMPLE_RATE)
-
-        def flush():
-            if not batch:
-                return
-            lens = np.array([len(x) for x in batch], dtype=np.float32)
-            padded = np.zeros((len(batch), maxlen), dtype=np.float32)
-            for i, x in enumerate(batch):
-                padded[i, : len(x)] = x[:maxlen]
-            wav = self._torch.from_numpy(padded)
-            wav_lens = self._torch.from_numpy(lens / maxlen).clamp(max=1.0)
-            with self._torch.no_grad():
-                e = self._encoder.encode_batch(wav, wav_lens).squeeze(1).cpu().numpy()
-            embs.append(e)
-            batch.clear()
-
-        for s, e in windows:
-            a, b = int(s * SAMPLE_RATE), int(e * SAMPLE_RATE)
-            x = audio[a:b]
-            if len(x) < int(0.3 * SAMPLE_RATE):
-                x = np.pad(x, (0, int(0.3 * SAMPLE_RATE) - len(x)))
-            batch.append(x)
-            if len(batch) >= EMBED_BATCH:
-                flush()
-        flush()
-        out = np.concatenate(embs, axis=0) if embs else np.zeros((0, 192), dtype=np.float32)
-        norms = np.linalg.norm(out, axis=1, keepdims=True) + 1e-8
-        return out / norms
+        return self._embedder.embed(audio, windows, max_sec=settings.diarization.window_sec)
 
     def _cluster(self, embs: np.ndarray, min_speakers: int, max_speakers: int) -> np.ndarray:
         from sklearn.cluster import AgglomerativeClustering

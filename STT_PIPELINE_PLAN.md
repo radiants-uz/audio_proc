@@ -13,7 +13,7 @@
 | Стек | Как у doc-proc: FastAPI + arq + Redis Stack (JSON) + Postgres/alembic + MinIO + sqladmin, `uv`. Python **3.12** (torch/pyannote/speechbrain ещё не собраны под 3.14 — единственное отличие от doc-proc). |
 | LLM для анализа | **Только GLM-5.3 заказчика** (self-hosted, OpenAI-совместимый). Бэкенда Anthropic нет вообще. Контекст локальной модели **120k**, поэтому `max_input_tokens: 40000`, `chunk_tokens: 30000` (map-reduce включается чаще, чем предполагалось). `reasoning_effort: low`. Строгий `response_format: json_schema` через SGLang **ломает ответ** (пустые списки, пропущенные поля — проверено 2026-09-20), поэтому схема вкладывается в промпт + `response_format: json_object`. |
 | ASR-API | `POST https://stt.robot-guide.iccu.uz/api/v1/asr/transcribe`, multipart `file` + `language_code` ∈ {`uz`,`ru`,`en`}, ответ `{"transcription": "..."}`, без авторизации. Тот же сервис уже используется ассистентом ARK (`apps/assistant/services/stt.py`). Куски ≤ 30 с, wav 16k mono. На 2026-09-20 отвечает 502 — для разработки есть `ASR_BACKEND=mock`. |
-| Диаризация | HF-токена нет. Основной бэкенд `pyannote` (gated, нужен `HF_TOKEN` — завести бесплатно и принять условия модели). Для разработки без токена — бэкенд `simple`: silero-VAD + эмбеддинги `speechbrain/spkrec-ecapa-voxceleb` + агломеративная кластеризация. Переключается конфигом `DIARIZATION_BACKEND`. |
+| Диаризация | **Только `pyannote/speaker-diarization-community-1`** (решение 2026-09-22, бэкенд по умолчанию; gated, нужен `AUDIO_HF_TOKEN` — завести бесплатно и принять условия модели). Бэкенд `simple` (silero-VAD + `speechbrain/spkrec-ecapa-voxceleb` + кластеризация) остаётся только для разработки без токена и включается явно. |
 | Железо | Пока разработка на MacBook (M4, 16 ГБ, CPU/MPS). GPU-сервер появится позже; код device-agnostic (`DEVICE=cpu|cuda|mps`). |
 | ARK | Делаем и бэкенд (`apps/audioproc` по образцу `apps/docproc`), и фронтенд (страница обработки аудио + настройки в админке). |
 | Отчёт | Шаблон .docx от заказчика отсутствует — отчёт собирается кодом (`python-docx`), тексты секций на ru/uz/en. PDF через LibreOffice. |
@@ -282,6 +282,17 @@ class Segment:
 6. Отсортировать по `start`, присвоить `id`.
 
 Написать unit-тесты на 1–4 (синтетические turns).
+
+### 5.3b Слияние ложных спикеров (`speakers.py`) и улучшение звука (`enhance.py`) — добавлено 2026-09-22
+
+Диаризация на реальных записях (дальний микрофон, эхо) дробит 2 голоса на 8–15 «спикеров» из обрывков.
+После `build_segments` считаем ECAPA-эмбеддинг каждого спикера (`speechbrain/spkrec-ecapa-voxceleb`, общий с simple-бэкендом)
+и сливаем: спикеров с речью < 6 с или долей < 3% — с ближайшим по голосу; пары с косинусной близостью > 0.8; при заданном
+`expected_speakers` — до точного числа. Результат в `meta.models.speakers_merge`, warning `speakers_merged`.
+
+Перед ASR и LID звук улучшается адаптивно по замерам ffmpeg: тихая запись → `speechnorm`, шумная → `afftdn`, всегда `highpass 80 Гц`;
+чистые громкие записи не трогаются (на студийной записи шумодав ухудшал распознавание). Диаризация всегда идёт по исходному сигналу —
+шумодав искажает голосовые эмбеддинги. Пороги — `ENHANCE_*`, `SPEAKERS_*`.
 
 ### 5.4 Language ID per speaker (`pipeline/langid.py`)
 

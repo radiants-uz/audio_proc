@@ -36,7 +36,7 @@
   "stage": "ingest | diarization | langid | asr | assemble | analysis | report",
   "total_stages": 5, "current_stage": 3,     // transcribe=5, analyze=6, report=7, rebuild=2
   "total": 12, "current": 7,                 // внутри стадии: сегменты ASR / куски анализа
-  "warnings": ["speaker_count_low"],         // опц.: no_speech, asr_mostly_empty, lid_low_confidence, speaker_too_short_for_lid, analysis_failed, pdf_failed
+  "warnings": ["speaker_count_low"],         // опц.: no_speech, asr_mostly_empty, speakers_merged, lid_low_confidence, speaker_too_short_for_lid, analysis_failed, pdf_failed
   "details": "текст ошибки",                 // только при error
   "processed_document": { … DocumentResponse … },   // главный результат операции
   "documents": {                             // все результаты; ARK сохраняет каждый

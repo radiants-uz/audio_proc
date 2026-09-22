@@ -18,12 +18,14 @@ from app.services.audio_processing import assemble
 from app.services.audio_processing.analysis.analyze import analyze_transcript
 from app.services.audio_processing.analysis.llm_openai import OpenAICompatibleClient
 from app.services.audio_processing.asr import build_asr_client
+from app.services.audio_processing.enhance import enhance_for_asr
 from app.services.audio_processing.ingest import IngestError, load_wav, to_wav16k
 from app.services.audio_processing.langid import identify_speakers, recheck_segments
 from app.services.audio_processing.models import ModelRegistry
 from app.services.audio_processing.report.build import DOCX_CT, PDF_CT, build_docx, docx_to_pdf
 from app.services.audio_processing.router import transcribe_segments
 from app.services.audio_processing.segments import SegmentConfig, build_segments
+from app.services.audio_processing.speakers import merge_speakers
 from app.services.progress import Progress
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,14 @@ class PipelineRunner:
         timings["ingest"] = time.perf_counter() - t0
         logger.info("ingest: %.1fs of audio in %.1fs", duration, timings["ingest"])
 
+        # [1b] улучшение звука для ASR и LID (диаризация — по исходному сигналу)
+        t0 = time.perf_counter()
+        enh_path, enh_filters, stats = await asyncio.to_thread(
+            enhance_for_asr, wav_path, self.work_dir / "audio16k_enh.wav"
+        )
+        asr_audio = audio if enh_path == wav_path else await asyncio.to_thread(load_wav, enh_path)
+        timings["enhance"] = time.perf_counter() - t0
+
         # [2] diarization
         await self.progress.set_stage(Stage.DIARIZATION)
         t0 = time.perf_counter()
@@ -80,15 +90,24 @@ class PipelineRunner:
         if not segments:
             warnings.append("no_speech")
 
+        # [3b] слияние ложных спикеров (обрывки шума, эхо) по голосовым эмбеддингам
+        merge_report = None
+        if segments and settings.speakers.enabled:
+            merge_report = await asyncio.to_thread(
+                merge_speakers, self.models.embedder.embed, audio, segments, params.expected_speakers
+            )
+            if merge_report.merged:
+                warnings.append("speakers_merged")
+
         # [4] LID
         await self.progress.set_stage(Stage.LANGID, total=max(1, len({s.speaker for s in segments})))
         t0 = time.perf_counter()
-        languages = await asyncio.to_thread(identify_speakers, self.models.langid, audio, segments, warnings) if segments else {}
+        languages = await asyncio.to_thread(identify_speakers, self.models.langid, asr_audio, segments, warnings) if segments else {}
         for seg in segments:
             seg.language = languages[seg.speaker].language
         recheck = params.lid_recheck if params.lid_recheck is not None else settings.langid.per_segment_recheck
         if recheck and segments:
-            changed = await asyncio.to_thread(recheck_segments, self.models.langid, audio, segments)
+            changed = await asyncio.to_thread(recheck_segments, self.models.langid, asr_audio, segments)
             logger.info("LID recheck changed %d segments", changed)
         timings["langid"] = time.perf_counter() - t0
 
@@ -102,7 +121,7 @@ class PipelineRunner:
                 await self.progress.set_current(done)
 
             if segments:
-                await transcribe_segments(asr, audio, duration, segments, on_batch_done=on_batch)
+                await transcribe_segments(asr, asr_audio, duration, segments, on_batch_done=on_batch)
         finally:
             await asr.aclose()
         timings["asr"] = time.perf_counter() - t0
@@ -130,6 +149,12 @@ class PipelineRunner:
             languages=languages,
             models={
                 "diarization": diar.model_name,
+                "speaker_embedder": self.models.embedder.model_name,
+                "enhance": {"filters": enh_filters, "mean_db": stats.mean_db, "noise_floor_db": stats.noise_floor_db},
+                "speakers_merge": (
+                    {"before": merge_report.before, "after": merge_report.after, "merged": merge_report.merged}
+                    if merge_report else None
+                ),
                 "langid": self.models.langid.model_name,
                 "asr": {"backend": asr.name, "uz": "nvidia/stt_uz_fastconformer_hybrid_large_pc",
                         "ru": "gigaam-v3-e2e-rnnt", "en": "nvidia/parakeet-tdt-0.6b-v2"},
