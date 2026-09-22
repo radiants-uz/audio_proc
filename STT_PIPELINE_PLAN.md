@@ -10,7 +10,7 @@
 | Тема | Решение |
 |---|---|
 | Клиент сервиса | **Не Flutter, а ARK** (`ark-backend` Django/Celery + `ark-frontend` React). Сервис работает по образцу `doc-proc`: `X-API-Key`, `POST … → 202 {task_id}`, ARK опрашивает `GET /v1/audio/tasks/{task_id}`, результат — presigned-ссылка на MinIO. Колбэков нет. Старый контракт §6 «для Flutter» заменён (см. новый §6). |
-| Стек | Как у doc-proc: FastAPI + arq + Redis Stack (JSON) + Postgres/alembic + MinIO + sqladmin, `uv`. Python **3.12** (torch/pyannote/speechbrain ещё не собраны под 3.14 — единственное отличие от doc-proc). |
+| Стек | Как у doc-proc: FastAPI + arq + Redis Stack (JSON) + Postgres/alembic + MinIO + sqladmin, `uv`. Python **3.11** (с 2026-09-23: пакет `deepfilternet` не имеет колёс для 3.12+; torch/pyannote/speechbrain под 3.11 собраны). |
 | LLM для анализа | **Только GLM-5.3 заказчика** (self-hosted, OpenAI-совместимый). Бэкенда Anthropic нет вообще. Контекст локальной модели **120k**, поэтому `max_input_tokens: 40000`, `chunk_tokens: 30000` (map-reduce включается чаще, чем предполагалось). `reasoning_effort: low`. Строгий `response_format: json_schema` через SGLang **ломает ответ** (пустые списки, пропущенные поля — проверено 2026-09-20), поэтому схема вкладывается в промпт + `response_format: json_object`. |
 | ASR-API | `POST https://stt.robot-guide.iccu.uz/api/v1/asr/transcribe`, multipart `file` + `language_code` ∈ {`uz`,`ru`,`en`}, ответ `{"transcription": "..."}`, без авторизации. Тот же сервис уже используется ассистентом ARK (`apps/assistant/services/stt.py`). Куски ≤ 30 с, wav 16k mono. На 2026-09-20 отвечает 502 — для разработки есть `ASR_BACKEND=mock`. |
 | Диаризация | **Только `pyannote/speaker-diarization-community-1`** (решение 2026-09-22, бэкенд по умолчанию; gated, нужен `AUDIO_HF_TOKEN` — завести бесплатно и принять условия модели). Бэкенд `simple` (silero-VAD + `speechbrain/spkrec-ecapa-voxceleb` + кластеризация) остаётся только для разработки без токена и включается явно. |
@@ -290,6 +290,12 @@ class Segment:
 и сливаем: спикеров с речью < 6 с или долей < 3% — с ближайшим по голосу; пары с косинусной близостью > 0.8; при заданном
 `expected_speakers` — до точного числа. Результат в `meta.models.speakers_merge`, warning `speakers_merged`.
 
+Нейросетевая чистка (2026-09-22). Сравнивались DeepFilterNet3, ClearerVoice (FRCRN_SE_16K, MossFormerGAN_SE_16K, MossFormer2_SE_48K)
+и Resemble Enhance на 16 речевых кусках дальней записи, метрика — сколько текста возвращает ASR (uz + ru) после обработки
+(см. README, таблица «Нейросетевая чистка»). DeepFilterNet3 встроен через Python-пакет `deepfilternet` (бинарник `deep-filter` давал в 2–5 раз меньше текста);
+из-за него бэкенд переведён на Python 3.11. Модель грузится в воркере при старте, 403 с аудио → ~10 с на CPU, включается
+`ENHANCE_NEURAL=deepfilter` (по умолчанию), применяется ко всему файлу перед ffmpeg-фильтрами. Диаризация по-прежнему по исходному сигналу.
+
 Перед ASR и LID звук улучшается адаптивно по замерам ffmpeg: тихая запись → `speechnorm`, шумная → `afftdn`, всегда `highpass 80 Гц`;
 чистые громкие записи не трогаются (на студийной записи шумодав ухудшал распознавание). Диаризация всегда идёт по исходному сигналу —
 шумодав искажает голосовые эмбеддинги. Пороги — `ENHANCE_*`, `SPEAKERS_*`.
@@ -351,6 +357,13 @@ class AsrClient(Protocol):
 - Для каждого сегмента: вырезать wav с padding (§5.3 п.5), кодировать в WAV 16k mono PCM16 bytes.
 - Результат привязать к `segment.id`. Если пришли `words` — прибавить `segment.start - pad_left` к каждому `start/end`, обрезать по границам сегмента.
 - Прогресс job'а обновлять после каждого батча (`progress: 0.0–1.0`).
+
+Куски для ASR (2026-09-22/23). Сегмент диаризации (до 28 с) режется по речевым областям silero-VAD (паддинг 0.3 с,
+`ASR_VAD_CHUNKS`), области длиннее `ASR_MAX_CHUNK_SEC` (8 с) — дополнительно в тихих точках. VAD-нарезка против фиксированных
+8 с на дальней записи: 18/40 сегментов с текстом (563 симв.) против 12/40 (365). Раньше: сегмент резался фиксированно,
+тексты кусков склеиваются в текст сегмента. Замер на дальней записи с DeepFilterNet: 28 с → 13/40 сегментов с текстом (129 симв.),
+12 с → 14/40, 8 с → 21/40 (355 симв.), 5 с → 23/40 (294 симв.). Пустой кусок при `ASR_FALLBACK_LANGS=true` повторяется на остальных
+языках, найденных в файле (помогает при смешанной речи и ошибке LID; дорого только на пустых кусках).
 
 ### 5.7 Assembler (`pipeline/assemble.py`)
 

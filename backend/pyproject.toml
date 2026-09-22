@@ -3,7 +3,7 @@ name = "audio-processor"
 version = "0.1.0"
 description = "Multi-speaker speech recognition (uz/ru/en) with diarization, LLM analysis and reports — a doc-proc-style service for ARK"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     # --- как в doc-proc ---
     "fastapi>=0.115,<1",
@@ -25,11 +25,15 @@ dependencies = [
     "soundfile>=0.12",
     "torch>=2.4",
     "torchaudio>=2.4",
-    "pyannote.audio>=3.3",
+    "pyannote.audio>=4.0,<5",
     "speechbrain>=1.0",
     "scikit-learn>=1.4",
     "silero-vad>=5.1",
     "onnxruntime>=1.18",
+    # нейрошумодав DeepFilterNet3 (см. app/services/audio_processing/denoise.py)
+    "deepfilternet>=0.5.6",
+    "deepfilterlib>=0.5.6",
+    "loguru>=0.7",
     # --- анализ и отчёты ---
     "openai>=1.40",
     "python-docx>=1.1",
@@ -45,6 +49,11 @@ dev = [
 
 [tool.uv]
 package = false
+# deepfilternet 0.5.6 объявляет numpy<2, pyannote-core 6 требует numpy>=2. DeepFilterNet
+# с numpy 2 работает (проверено на дальней записи 2026-09-23), поэтому ограничение снимаем.
+override-dependencies = ["numpy>=2.0,<3"]
+# Только Linux (сервер, Docker) и macOS (разработка): без Windows-резолва лок проще и быстрее.
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]
 
 # torch/torchaudio с PyPI под Linux — CUDA-сборка (+ nvidia-* ≈ 3–4 ГБ), а сервер
 # без GPU. Для Linux берём CPU-колёса из индекса PyTorch; на macOS колёса с PyPI
@@ -64,7 +73,7 @@ asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "W"]

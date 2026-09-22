@@ -56,19 +56,46 @@ def build_filters(stats: AudioStats) -> list[str]:
     return filters
 
 
-def enhance_for_asr(wav16k: Path, out: Path) -> tuple[Path, list[str], AudioStats]:
-    """Возвращает путь к wav для ASR (исходный, если обработка не нужна)."""
+def enhance_for_asr(
+    wav16k: Path, out: Path, denoiser=None
+) -> tuple[Path, list[str], AudioStats]:
+    """Возвращает путь к wav для ASR (исходный, если обработка не нужна).
+    Порядок: нейрошумодав DeepFilterNet (если включён и загружен) → ffmpeg-фильтры по замерам."""
+    import soundfile as sf
+
     stats = measure(wav16k)
     if not settings.enhance.enabled:
         return wav16k, [], stats
-    filters = build_filters(stats)
+    applied: list[str] = []
+    src = wav16k
+    if settings.enhance.neural == "deepfilter":
+        if denoiser is not None and denoiser.loaded:
+            try:
+                audio, sr = sf.read(str(wav16k), dtype="float32")
+                if audio.ndim > 1:
+                    audio = audio.mean(axis=1)
+                src = out.with_name("audio16k_df.wav")
+                sf.write(str(src), denoiser.denoise(audio), sr, subtype="PCM_16")
+                applied.append(denoiser.name)
+            except Exception as e:  # noqa: BLE001 — шумодав улучшение, а не условие
+                logger.warning("deepfilter failed, continuing without it: %s", str(e)[:200])
+                src = wav16k
+        else:
+            logger.warning("ENHANCE_NEURAL=deepfilter, but the denoiser is not loaded — skipped")
+    # После нейрошумодава уровень падает — замеряем заново, чтобы speechnorm включился по факту.
+    post = measure(src) if src is not wav16k else stats
+    filters = build_filters(post)
     if filters == ["highpass=f=80"] and not settings.enhance.always_highpass:
-        logger.info("enhance: clean recording (mean %.1f dB, noise %s) — skipped", stats.mean_db, stats.noise_floor_db)
-        return wav16k, [], stats
+        if src is wav16k:
+            logger.info("enhance: clean recording (mean %.1f dB, noise %s) — skipped", stats.mean_db, stats.noise_floor_db)
+            return wav16k, [], stats
+        logger.info("enhance: %s (mean %.1f → %.1f dB)", ",".join(applied), stats.mean_db, post.mean_db)
+        return src, applied, stats
     subprocess.run(
-        ["ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(wav16k),
+        ["ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(src),
          "-af", ",".join(filters), "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", str(out)],
         capture_output=True, text=True, timeout=1800, check=True,
     )
-    logger.info("enhance: mean %.1f dB, noise %s → %s", stats.mean_db, stats.noise_floor_db, ",".join(filters))
-    return out, filters, stats
+    applied.extend(filters)
+    logger.info("enhance: mean %.1f dB, noise %s → %s", stats.mean_db, stats.noise_floor_db, ",".join(applied))
+    return out, applied, stats

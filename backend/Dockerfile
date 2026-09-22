@@ -1,11 +1,13 @@
-# syntax=docker/dockerfile:1
+# Без директивы `# syntax=docker/dockerfile:1`: она заставляет BuildKit на каждую сборку
+# тянуть образ фронтенда с Docker Hub, и при любой сетевой заминке (IPv6 в VM Docker Desktop)
+# сборка падает ещё до первого шага. Встроенного фронтенда хватает (cache mounts поддерживаются).
 
 # =====================================================================
-# base — uv + Python 3.12 (torch/pyannote/speechbrain ещё не собраны под
-# 3.14, это единственное отличие от doc-proc). venv лежит в /opt/venv
+# base — uv + Python 3.11: deepfilternet (нейрошумодав) не имеет колёс для 3.12+,
+# torch/pyannote/speechbrain под 3.11 собраны — это отличие от doc-proc (3.14). venv лежит в /opt/venv
 # (ВНЕ /app), поэтому bind-mount поверх /app в dev его не перекрывает.
 # =====================================================================
-FROM ghcr.io/astral-sh/uv:python3.12-trixie-slim AS base
+FROM ghcr.io/astral-sh/uv:python3.11-trixie-slim AS base
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
@@ -19,14 +21,15 @@ RUN groupadd --gid 1000 appuser \
     && useradd --uid 1000 --gid 1000 --create-home appuser \
     && install -d -o appuser -g appuser /opt/venv /app /tmp/audio-proc /home/appuser/.cache
 
-# ffmpeg — ingest любого контейнера в wav 16k mono; libsndfile — soundfile;
+# ffmpeg — ingest любого контейнера в wav 16k mono; libsndfile — soundfile; git — его вызывает
+# deepfilternet при загрузке модели (df.utils, для версии в логах);
 # шрифты Noto/DejaVu — кириллица и узбекская латиница (oʻ gʻ) в PDF-отчётах.
 # LibreOffice (~400 МБ) нужен только для docx → pdf; --build-arg WITH_LIBREOFFICE=0
 # отключает его, тогда отчёт отдаётся только в docx.
 ARG WITH_LIBREOFFICE=1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg libsndfile1 libgomp1 curl fonts-dejavu-core fonts-noto-core \
+        ffmpeg libsndfile1 libgomp1 curl git fonts-dejavu-core fonts-noto-core \
     && if [ "$WITH_LIBREOFFICE" = "1" ]; then \
         apt-get install -y --no-install-recommends libreoffice-writer fonts-liberation; \
     fi \
@@ -61,7 +64,7 @@ COPY . .
 # =====================================================================
 # prod — тонкий рантайм, без uv: только venv + приложение, non-root.
 # =====================================================================
-FROM python:3.12-slim-trixie AS prod
+FROM python:3.11-slim-trixie AS prod
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
@@ -70,7 +73,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
 ARG WITH_LIBREOFFICE=1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg libsndfile1 libgomp1 curl fonts-dejavu-core fonts-noto-core \
+        ffmpeg libsndfile1 libgomp1 curl git fonts-dejavu-core fonts-noto-core \
     && if [ "$WITH_LIBREOFFICE" = "1" ]; then \
         apt-get install -y --no-install-recommends libreoffice-writer fonts-liberation; \
     fi \

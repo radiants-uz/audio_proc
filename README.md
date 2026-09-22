@@ -21,13 +21,13 @@ audio (любой контейнер) → ffmpeg 16k mono → диаризаци
 | Диаризация | **`pyannote/speaker-diarization-community-1`** (по умолчанию; gated, нужен `AUDIO_HF_TOKEN`). `simple` (silero-VAD + ECAPA + кластеризация) — только для разработки без токена | `DIARIZATION_BACKEND=pyannote\|simple` |
 | ASR | `POST https://stt.robot-guide.iccu.uz/api/v1/asr/transcribe` (multipart `file` + `language_code`) или `mock` для разработки | `ASR_BACKEND=remote\|mock` |
 | LLM | любой OpenAI-совместимый эндпоинт (GLM-5.3 через vLLM/SGLang); сервисы заводятся в `/admin` → LLM services | строка `Service` в БД |
-| Улучшение звука | адаптивно перед ASR/LID: тихо → `speechnorm`, шумно → `afftdn`, диаризация по исходнику | `ENHANCE_*` |
+| Улучшение звука | перед ASR/LID: нейрошумодав DeepFilterNet3 (Python-пакет, грузится в воркере) + адаптивно тихо → `speechnorm`, шумно → `afftdn`; диаризация по исходнику | `ENHANCE_NEURAL=deepfilter\|none`, `ENHANCE_*` |
 | Спикеры | слияние ложных спикеров по ECAPA-эмбеддингам (мелкие, похожие, `expected_speakers`) | `SPEAKERS_*` |
 | PDF | LibreOffice headless в образе воркера (`WITH_LIBREOFFICE=1`) | без него — только docx + warning `pdf_failed` |
 
 ## Стек
 
-Python 3.12, FastAPI, arq (очередь на Redis Stack), Postgres + alembic, MinIO (aioboto3), sqladmin, uv.
+Python 3.11 (deepfilternet не имеет колёс для 3.12+), FastAPI, arq (очередь на Redis Stack), Postgres + alembic, MinIO (aioboto3), sqladmin, uv.
 Одна задача на процесс воркера (модели в памяти); параллельность — числом воркеров.
 
 ## Быстрый старт (Docker)
@@ -118,6 +118,31 @@ sh scripts/run.sh up   # docker compose -f docker-compose.yml -f docker-compose.
 - `ASR_BACKEND`, `ASR_API_URL`, `ASR_CONCURRENCY`, `ASR_TIMEOUT_SEC`, `ASR_RETRIES`
 - `ANALYSIS_MAX_INPUT_TOKENS=40000`, `ANALYSIS_CHUNK_TOKENS=30000` (контекст локальной GLM-5.3 — 120k)
 - `ARQ_MAX_WORKERS=1`, `ARQ_JOB_TIMEOUT=3600`, `ARQ_MAX_TRIES=1`
+
+## Нейросетевая чистка звука (2026-09-23)
+
+Кандидаты сравнивались на 16 речевых кусках (3–12 с) дальней записи совещания; метрика — сколько текста возвращает ASR
+(uz-модель NeMo и ru-модель GigaAM) после обработки + `speechnorm`. Сырой сигнал: uz 0 кусков, ru 270 симв. (обрывки).
+
+| Модель | uz-текст (кусков/16) | ru-текст, симв. | CPU на 5-с кусок |
+|---|---|---|---|
+| **DeepFilterNet3 (Python)** | **6/16, 119 симв.** | 99 | 0.3 с |
+| DeepFilterNet3 (бинарник deep-filter) | 1–3/16, 20–66 | 1–11 | 0.3 с |
+| ClearerVoice MossFormerGAN_SE_16K | 5/16, 87 | 312 | 29 с |
+| ClearerVoice MossFormer2_SE_48K | 0/16, 4 | 193 | 2 с |
+| ClearerVoice FRCRN_SE_16K | 0/16, 3 | 201 | 47 с |
+| Resemble Enhance (denoise) | 0/16 | ≈ сырой | 5 с |
+| Resemble Enhance (enhance, диффузия) | 13/16, 337 симв. — **выдуманная речь** | 28 | 38 с |
+| ffmpeg speechnorm | 0/16 | 243 | 0.1 с |
+
+Выбран DeepFilterNet3 через Python-пакет: единственный, кто даёт узбекский текст при приемлемой цене на CPU
+(403 с записи ≈ 20 с). MossFormerGAN сопоставим по узбекскому, но в 100 раз медленнее. Resemble Enhance в режиме
+enhance даёт больше всего «текста», но это генеративная модель: она дорисовывает речь, и ASR распознаёт правдоподобные,
+но выдуманные фразы («Dubaydagi Sarsang London», «U Britaniya uchun shunday joy») — для протоколов совещаний неприемлемо.
+Метрика «сколько символов» для генеративных улучшателей не годится, нужна сверка с тем, что реально сказано. Шумодав иногда срезает тихую
+речь, поэтому пустой кусок повторно распознаётся на исходном сигнале (`ASR_RAW_FALLBACK`), а затем на других языках
+(`ASR_FALLBACK_LANGS`). Куски для ASR режутся по речи silero-VAD (`ASR_VAD_CHUNKS`, паддинг 0.3 с) и не длиннее `ASR_MAX_CHUNK_SEC` (8 с):
+на длинных кусках и кусках с тишиной модель молчит (VAD-нарезка: 18/40 сегментов с текстом против 12/40 фиксированными 8 с).
 
 ## Замеры диаризации (2026-09-22, Apple M4, CPU)
 

@@ -40,13 +40,17 @@ def _best_cut(audio: np.ndarray | None, target: float, window: float = 3.0, fram
     hi = min(len(audio) / SAMPLE_RATE, target + window)
     if hi - lo < frame * 2:
         return target
-    best_t, best_e = target, float("inf")
+    best_t, best_score = target, float("inf")
+    # При равной тишине (пауза, полная тишина) берём точку ближе к цели, а не
+    # самую раннюю в окне — иначе куски получаются рваными и короче нужного.
+    scale = float(np.mean(audio**2)) + 1e-12
     t = lo
     while t + frame <= hi:
         a, b = int(t * SAMPLE_RATE), int((t + frame) * SAMPLE_RATE)
         e = float(np.mean(audio[a:b] ** 2)) if b > a else float("inf")
-        if e < best_e:
-            best_e, best_t = e, t + frame / 2
+        score = e / scale + 1e-3 * abs(t + frame / 2 - target) / window
+        if score < best_score:
+            best_score, best_t = score, t + frame / 2
         t += frame
     return best_t
 

@@ -23,7 +23,7 @@ from app.services.audio_processing.ingest import IngestError, load_wav, to_wav16
 from app.services.audio_processing.langid import identify_speakers, recheck_segments
 from app.services.audio_processing.models import ModelRegistry
 from app.services.audio_processing.report.build import DOCX_CT, PDF_CT, build_docx, docx_to_pdf
-from app.services.audio_processing.router import transcribe_segments
+from app.services.audio_processing.router import has_words, transcribe_segments
 from app.services.audio_processing.segments import SegmentConfig, build_segments
 from app.services.audio_processing.speakers import merge_speakers
 from app.services.progress import Progress
@@ -67,7 +67,7 @@ class PipelineRunner:
         # [1b] улучшение звука для ASR и LID (диаризация — по исходному сигналу)
         t0 = time.perf_counter()
         enh_path, enh_filters, stats = await asyncio.to_thread(
-            enhance_for_asr, wav_path, self.work_dir / "audio16k_enh.wav"
+            enhance_for_asr, wav_path, self.work_dir / "audio16k_enh.wav", self.models.denoiser
         )
         asr_audio = audio if enh_path == wav_path else await asyncio.to_thread(load_wav, enh_path)
         timings["enhance"] = time.perf_counter() - t0
@@ -121,14 +121,24 @@ class PipelineRunner:
                 await self.progress.set_current(done)
 
             if segments:
-                await transcribe_segments(asr, asr_audio, duration, segments, on_batch_done=on_batch)
+                # Запасные языки для пустых кусков: сначала языки, найденные в файле,
+                # затем остальные разрешённые — на смешанных записях LID по спикеру
+                # видит один язык, а реплики бывают и на другом.
+                file_langs = {r.language for r in languages.values() if r.language}
+                fallback = [x for x in settings.langid.allowed if x in file_langs] + [
+                    x for x in settings.langid.allowed if x not in file_langs
+                ]
+                await transcribe_segments(
+                    asr, asr_audio, duration, segments, on_batch_done=on_batch, fallback_langs=fallback,
+                    raw_audio=audio, vad=self.models.vad,
+                )
         finally:
             await asr.aclose()
         timings["asr"] = time.perf_counter() - t0
         # ASR отдал пустой текст на большинстве реплик: почти всегда это тихая,
         # дальняя или зашумлённая запись, а не отсутствие речи. Пусть ARK покажет это.
         if segments:
-            empty = sum(1 for s in segments if not (s.text or "").strip())
+            empty = sum(1 for s in segments if not has_words(s.text))
             if empty / len(segments) >= settings.asr.empty_warning_ratio:
                 warnings.append("asr_mostly_empty")
                 logger.warning("ASR returned empty text for %d/%d segments", empty, len(segments))

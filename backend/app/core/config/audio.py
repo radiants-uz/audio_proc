@@ -75,6 +75,23 @@ class AsrSettings(BaseSettings):
     concurrency: int = 4
     timeout_sec: float = 60.0
     retries: int = 3
+    # Кусок, отправляемый в ASR. Сегменты диаризации до 28 с режутся на куски
+    # ≤ max_chunk_sec в самых тихих точках: на дальних записях модель на длинных
+    # кусках молчит, на коротких — отдаёт текст (замерено 2026-09-22: 8 с → 21/40
+    # сегментов с текстом против 13/40 при 28 с).
+    max_chunk_sec: float = 8.0
+    # Резать куски по речевым областям silero-VAD (паддинг vad_pad_sec) вместо
+    # фиксированного шага: 18/40 сегментов с текстом против 12/40 (2026-09-23).
+    vad_chunks: bool = True
+    vad_pad_sec: float = 0.3
+    vad_min_silence_sec: float = 0.35
+    # Пустой ответ → повторить кусок на других языках файла (uz/ru/en). Дорого только
+    # на пустых кусках, помогает при смешанной речи и ошибке LID.
+    fallback_langs: bool = True
+    # Пустой ответ на улучшенном сигнале → повторить тот же кусок на исходном сигнале:
+    # нейрошумодав иногда срезает начало реплики или тихую речь целиком (замерено:
+    # DeepFilterNet терял часть русских реплик, которые сырой сигнал распознавал).
+    raw_fallback: bool = True
     # Доля реплик с пустым текстом, начиная с которой ставится warning asr_mostly_empty.
     empty_warning_ratio: float = 0.5
 
@@ -111,6 +128,10 @@ class EnhanceSettings(BaseSettings):
     speechnorm_expansion: float = 6.0
     # Прогонять highpass даже на чистых записях.
     always_highpass: bool = False
+    # Нейросетевой шумодав перед ASR/LID: none | deepfilter (DeepFilterNet3, Python-пакет,
+    # грузится в воркере при старте; CPU ≈ 40× быстрее реального времени). Применяется
+    # ко всей записи — на дальних микрофонах поднимает распознавание с нуля.
+    neural: Literal["none", "deepfilter"] = "deepfilter"
 
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="ENHANCE_", case_sensitive=False, extra="ignore"
