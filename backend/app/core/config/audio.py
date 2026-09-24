@@ -26,6 +26,9 @@ class DiarizationSettings(BaseSettings):
     model: str = "pyannote/speaker-diarization-community-1"
     min_speakers: int = 1
     max_speakers: int = 15
+    # Батчи pyannote (по умолчанию в pyannote 32): меньше — меньше пик памяти на CPU.
+    segmentation_batch_size: int = 8
+    embedding_batch_size: int = 8
     # simple-бэкенд (без HF-токена): VAD + эмбеддинги + агломеративная кластеризация.
     embedding_model: str = "speechbrain/spkrec-ecapa-voxceleb"
     cluster_threshold: float = 0.7
@@ -59,6 +62,27 @@ class LangIdSettings(BaseSettings):
     recheck_min_segment_sec: float = 4.0
     recheck_min_confidence: float = 0.9
 
+    # --- режим по кускам (по умолчанию; false = legacy «язык на спикера») ---
+    chunk_lid: bool = True
+    # Кусок ≥ chunk_min_sec решает сам при уверенности ≥ chunk_min_confidence:
+    # 0 ошибок среди 1782 окон ≥ 2 с при ≥ 0.9 (худшая ошибка на реальных кусках 0.754).
+    chunk_min_confidence: float = 0.90
+    chunk_min_sec: float = 2.0
+    # Кусок < chunk_min_sec решает сам только при ≥ chunk_short_confidence
+    # (0.98: 80/156 коротких окон, 0 ошибок; при 0.9 — 5 ошибок).
+    chunk_short_confidence: float = 0.98
+    # Короткий кусок, спорящий со ВСЕМИ решёнными соседями того же спикера, решает сам
+    # только при такой уверенности (корпус: верные 1.0/1.0, ошибка на русском куске 1.1 с — en 0.985).
+    chunk_short_against_confidence: float = 0.995
+    # Короче — не классифицируем вовсе, только наследуем.
+    chunk_lid_min_sec: float = 1.0
+    # Как далеко (по тому же спикеру) неуверенный кусок ищет решённого соседа.
+    neighbour_max_gap_sec: float = 30.0
+    # Минимум классифицированной речи спикера для мягкого приора.
+    prior_min_sec: float = 2.0
+    # LID по исходному сигналу (все замеры сделаны на нём), а не после шумодава.
+    on_raw_audio: bool = True
+
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="LANGID_", case_sensitive=False, extra="ignore"
     )
@@ -88,6 +112,19 @@ class AsrSettings(BaseSettings):
     # Пустой ответ → повторить кусок на других языках файла (uz/ru/en). Дорого только
     # на пустых кусках, помогает при смешанной речи и ошибке LID.
     fallback_langs: bool = True
+    # Языки, которые реально обслуживает ASR-бэкенд (маршрутизация и повторы —
+    # LANGID_ALLOWED ∩ ASR_LANGUAGES). Локальный stt-server без en: ["uz","ru"].
+    languages: list[str] = ["uz", "ru", "en"]
+    # Проверка текста ASR на «не тот язык» (textcheck.py) с повтором другим языком.
+    # Безопасна по построению: повтор заменяет исходник, только если сам прошёл проверку.
+    text_check: bool = True
+    text_check_min_tokens: int = 3
+    # Плотность текста, символов на секунду куска: верные транскрипты ≥ 7, чужие p10 = 2.3–3.0.
+    text_check_min_cps: float = 4.0
+    # Правило плотности только на кусках не короче этого (односложные ответы в 1–2 с нормальны).
+    text_check_density_min_sec: float = 2.0
+    # Максимум языков-кандидатов на повтор для одного помеченного куска.
+    retry_langs_max: int = 2
     # Пустой ответ на улучшенном сигнале → повторить тот же кусок на исходном сигнале:
     # нейрошумодав иногда срезает начало реплики или тихую речь целиком (замерено:
     # DeepFilterNet терял часть русских реплик, которые сырой сигнал распознавал).
@@ -132,6 +169,10 @@ class EnhanceSettings(BaseSettings):
     # грузится в воркере при старте; CPU ≈ 40× быстрее реального времени). Применяется
     # ко всей записи — на дальних микрофонах поднимает распознавание с нуля.
     neural: Literal["none", "deepfilter"] = "deepfilter"
+    # DeepFilterNet считает файл окнами (с, перекрытие с кроссфейдом), а не целиком:
+    # на 6,7-минутной записи целиком он выедал память воркера в Docker (OOM, exit 137).
+    deepfilter_chunk_sec: float = 30.0
+    deepfilter_overlap_sec: float = 1.0
 
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="ENHANCE_", case_sensitive=False, extra="ignore"

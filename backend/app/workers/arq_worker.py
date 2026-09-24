@@ -24,7 +24,9 @@ HEARTBEAT_TTL = 30
 async def process_audio_task(ctx, context: dict):
     redis: Redis = ctx["redis"]
     models: ModelRegistry = ctx["models"]
-    await process_audio(redis=redis, models=models, context=AudioTaskContext.model_validate(context))
+    await process_audio(
+        redis=redis, models=models, context=AudioTaskContext.model_validate(context), worker_id=ctx.get("worker_id")
+    )
 
 
 async def _heartbeat_loop(redis: Redis, worker_id: str):

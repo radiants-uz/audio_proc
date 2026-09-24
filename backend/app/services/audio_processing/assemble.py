@@ -4,7 +4,7 @@
 from app.services.audio_processing.langid import LangResult
 from app.services.audio_processing.types import Segment
 
-PIPELINE_VERSION = "1.0.0"
+PIPELINE_VERSION = "1.1.0"
 
 
 def rename_speakers(segments: list[Segment]) -> dict[str, str]:
@@ -15,6 +15,8 @@ def rename_speakers(segments: list[Segment]) -> dict[str, str]:
     for seg in segments:
         seg.speaker = mapping[seg.speaker]
         seg.overlap_with = sorted(mapping.get(o, o) for o in seg.overlap_with)
+        for ch in seg.chunks:
+            ch.speaker = mapping.get(ch.speaker, ch.speaker)
     return mapping
 
 
@@ -48,6 +50,8 @@ def assemble_transcript(
             "name": speaker_names.get(spk),
             "language": languages[spk].language if spk in languages else "",
             "lang_confidence": round(languages[spk].confidence, 3) if spk in languages else 0.0,
+            # раскладка по языкам (режим по кускам): [{language, speech_sec, share}]
+            "languages": languages[spk].languages if spk in languages else None,
             "total_speech_sec": round(totals[spk], 2),
             "segments_count": counts[spk],
         }
@@ -69,7 +73,18 @@ def assemble_transcript(
                 "overlap": seg.overlap,
                 "overlap_with": seg.overlap_with,
                 "text": seg.text,
+                "lang_confidence": round(seg.lang_confidence, 3),
                 "words": seg.words,
+                # куски ASR с языком каждого (null в legacy-режиме)
+                "chunks": [
+                    {
+                        "start": round(c.start, 2), "end": round(c.end, 2), "language": c.language,
+                        "lang_confidence": round(c.lang_confidence, 3), "lang_source": c.lang_source,
+                        "text": c.text, **({"warning": c.warning} if c.warning else {}),
+                        **({"lid_language": c.lid_language} if c.lid_language else {}),
+                    }
+                    for c in seg.chunks
+                ] if seg.chunks else None,
             }
             for seg in segments
         ],

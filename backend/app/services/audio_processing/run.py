@@ -20,10 +20,15 @@ from app.services.audio_processing.analysis.llm_openai import OpenAICompatibleCl
 from app.services.audio_processing.asr import build_asr_client
 from app.services.audio_processing.enhance import enhance_for_asr
 from app.services.audio_processing.ingest import IngestError, load_wav, to_wav16k
-from app.services.audio_processing.langid import identify_speakers, recheck_segments
+from app.services.audio_processing.langid import (
+    identify_speakers,
+    label_chunks,
+    recheck_segments,
+    speaker_languages,
+)
 from app.services.audio_processing.models import ModelRegistry
 from app.services.audio_processing.report.build import DOCX_CT, PDF_CT, build_docx, docx_to_pdf
-from app.services.audio_processing.router import has_words, transcribe_segments
+from app.services.audio_processing.router import has_words, plan_chunks, transcribe_segments
 from app.services.audio_processing.segments import SegmentConfig, build_segments
 from app.services.audio_processing.speakers import merge_speakers
 from app.services.progress import Progress
@@ -99,39 +104,71 @@ class PipelineRunner:
             if merge_report.merged:
                 warnings.append("speakers_merged")
 
-        # [4] LID
-        await self.progress.set_stage(Stage.LANGID, total=max(1, len({s.speaker for s in segments})))
+        # [4] куски для ASR + язык
+        chunk_lid = settings.langid.chunk_lid
+        chunks = plan_chunks(segments, asr_audio, duration, self.models.vad) if segments else []
+        await self.progress.set_stage(Stage.LANGID, total=max(1, len(chunks)))
         t0 = time.perf_counter()
-        languages = await asyncio.to_thread(identify_speakers, self.models.langid, asr_audio, segments, warnings) if segments else {}
-        for seg in segments:
-            seg.language = languages[seg.speaker].language
-        recheck = params.lid_recheck if params.lid_recheck is not None else settings.langid.per_segment_recheck
-        if recheck and segments:
-            changed = await asyncio.to_thread(recheck_segments, self.models.langid, asr_audio, segments)
-            logger.info("LID recheck changed %d segments", changed)
+        lid_audio = audio if settings.langid.on_raw_audio else asr_audio
+        loop = asyncio.get_running_loop()
+
+        def lid_progress(done: int, total: int) -> None:
+            # label_chunks работает в потоке — прогресс возвращаем в цикл событий
+            asyncio.run_coroutine_threadsafe(self.progress.set_current(done), loop)
+
+        if chunk_lid:
+            # Язык — на каждый кусок (спикер может переключать языки, §5.4).
+            if chunks:
+                await asyncio.to_thread(label_chunks, self.models.langid, lid_audio, chunks, warnings, lid_progress)
+            # предварительно, без warnings: окончательно — после ASR (повторы меняют язык кусков)
+            languages = speaker_languages(chunks)
+        else:
+            # legacy: язык на спикера + необязательная перепроверка сегментов
+            # (lid_recheck из запроса переопределяет LANGID_PER_SEGMENT_RECHECK)
+            recheck = params.lid_recheck if params.lid_recheck is not None else settings.langid.per_segment_recheck
+            languages = await asyncio.to_thread(identify_speakers, self.models.langid, lid_audio, segments, warnings) if segments else {}
+            for seg in segments:
+                seg.language = languages[seg.speaker].language
+                seg.lang_confidence = languages[seg.speaker].confidence
+            if recheck and segments:
+                changed = await asyncio.to_thread(recheck_segments, self.models.langid, lid_audio, segments)
+                logger.info("LID recheck changed %d segments", changed)
+            for ch in chunks:
+                seg = next(x for x in segments if x.id == ch.seg_id)
+                ch.language, ch.lang_confidence, ch.lang_source = seg.language, seg.lang_confidence, "speaker"
         timings["langid"] = time.perf_counter() - t0
 
         # [5] ASR
-        await self.progress.set_stage(Stage.ASR, total=max(1, len(segments)))
+        await self.progress.set_stage(Stage.ASR, total=max(1, len(chunks)))
         t0 = time.perf_counter()
         asr = build_asr_client()
+        asr_stats: dict = {}
         try:
             async def on_batch(done: int, total: int):
-                await self.progress.set_total(total)
                 await self.progress.set_current(done)
 
             if segments:
-                # Запасные языки для пустых кусков: сначала языки, найденные в файле,
-                # затем остальные разрешённые — на смешанных записях LID по спикеру
-                # видит один язык, а реплики бывают и на другом.
-                file_langs = {r.language for r in languages.values() if r.language}
-                fallback = [x for x in settings.langid.allowed if x in file_langs] + [
-                    x for x in settings.langid.allowed if x not in file_langs
-                ]
-                await transcribe_segments(
-                    asr, asr_audio, duration, segments, on_batch_done=on_batch, fallback_langs=fallback,
-                    raw_audio=audio, vad=self.models.vad,
+                served = [x for x in settings.langid.allowed if x in settings.asr.languages]
+                asr_stats = await transcribe_segments(
+                    asr, asr_audio, duration, segments, chunks=chunks, on_batch_done=on_batch,
+                    raw_audio=audio, vad=self.models.vad, textcheck=self.models.textcheck,
+                    languages_served=served,
                 )
+                if asr_stats.get("unsupported"):
+                    warnings.append("asr_lang_unsupported")
+                if asr_stats.get("rejected_chunks"):
+                    warnings.append("asr_chunks_rejected")
+                # Повторы и перенаправления могли сменить язык кусков — языки спикеров
+                # (и warning lang_switch_detected) считаются по окончательным кускам.
+                post = speaker_languages(chunks, warnings)
+                if chunk_lid:
+                    languages = post
+                else:
+                    for spk, res in post.items():
+                        if spk in languages and res.language != languages[spk].language:
+                            languages[spk] = res
+                        elif spk in languages:
+                            languages[spk].languages = res.languages
         finally:
             await asr.aclose()
         timings["asr"] = time.perf_counter() - t0
@@ -166,6 +203,8 @@ class PipelineRunner:
                     if merge_report else None
                 ),
                 "langid": self.models.langid.model_name,
+                "langid_mode": "chunk" if chunk_lid else "speaker",
+                "asr_stats": asr_stats,
                 "asr": {"backend": asr.name, "uz": "nvidia/stt_uz_fastconformer_hybrid_large_pc",
                         "ru": "gigaam-v3-e2e-rnnt", "en": "nvidia/parakeet-tdt-0.6b-v2"},
             },
@@ -173,6 +212,9 @@ class PipelineRunner:
             config={
                 "min_speakers": min_spk, "max_speakers": max_spk,
                 "lid_min_confidence": settings.langid.min_confidence,
+                "chunk_min_confidence": settings.langid.chunk_min_confidence,
+                "chunk_min_sec": settings.langid.chunk_min_sec,
+                "text_check": settings.asr.text_check,
                 "max_segment_sec": seg_cfg.max_segment_sec,
                 "device": settings.audio.device,
             },

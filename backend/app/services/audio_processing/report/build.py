@@ -16,6 +16,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 
 from app.core.config import settings
+from app.services.audio_processing.analysis.analyze import segment_language_and_text
+from app.services.audio_processing.analysis.stats import compute_stats
 from app.services.audio_processing.report.charts import languages_chart, speakers_chart
 from app.services.audio_processing.report.i18n import strings
 
@@ -69,7 +71,9 @@ def build_docx(transcript: dict, analysis: dict, title: str | None, speaker_name
     h = doc.add_heading(heading, level=0)
     h.alignment = WD_ALIGN_PARAGRAPH.LEFT
     audio = transcript.get("audio", {})
-    langs = ", ".join(sorted({sp.get("language", "") for sp in transcript.get("speakers", []) if sp.get("language")}))
+    # все языки файла по времени речи (спикер может говорить на двух), а не только «главные»
+    by_language = stats.get("by_language") or compute_stats(transcript).get("by_language", [])
+    langs = ", ".join(x["language"] for x in by_language if x.get("language"))
     meta_lines = [
         f"{s['file']}: {audio.get('filename', '')}",
         f"{s['date']}: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
@@ -157,10 +161,10 @@ def build_docx(transcript: dict, analysis: dict, title: str | None, speaker_name
         doc.add_heading(s["transcript"], level=1)
         rows = []
         for seg in transcript.get("segments", []):
-            text = seg.get("text") or ""
+            lang, text = segment_language_and_text(seg)
             if seg.get("overlap"):
                 text = f"[{s['overlap']}] {text}"
-            rows.append([_hms(seg["start"]), names.get(seg["speaker"], seg["speaker"]), seg.get("language", ""), text])
+            rows.append([_hms(seg["start"]), names.get(seg["speaker"], seg["speaker"]), lang, text])
         if rows:
             _table(doc, [s["col_time"], s["col_speaker"], s["col_language"], s["col_text"]], rows, [0.8, 1.2, 0.5, 4.0])
 

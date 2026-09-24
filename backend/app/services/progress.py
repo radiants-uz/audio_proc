@@ -10,7 +10,7 @@ from redis.commands.json.path import Path
 
 from app.core.config import settings
 from app.exceptions.base import TaskIDNotFoundError
-from app.schemas.progress import PROGRESS_PREFIX, Stage, Status
+from app.schemas.progress import PROGRESS_PREFIX, WORKER_PREFIX, Stage, Status
 
 
 class Progress:
@@ -23,13 +23,16 @@ class Progress:
     async def exists(self) -> bool:
         return bool(await self._redis.json().get(self._key))
 
-    async def init(self, total_stages: int, stage: str = Stage.INGEST):
+    async def init(self, total_stages: int, stage: str = Stage.INGEST, worker_id: str | None = None):
         if not await self.exists():
             raise TaskIDNotFoundError(
                 f"Task ID '{self.task_id}' not found in Redis. Was it created by the API?"
             )
         now = datetime.now(UTC).isoformat()
         await self._set(".status", Status.PROCESSING)
+        # Кто обрабатывает: по heartbeat этого воркера API отличает «долго считает»
+        # от «процесс убит» (OOM в Docker, рестарт) — см. get_task_progress.
+        await self._set(".worker", worker_id or "")
         await self._set(".stage", stage)
         await self._set(".total_stages", total_stages)
         # Первая стадия уже идёт: current_stage/total_stages = 1/N.
@@ -102,4 +105,15 @@ async def get_task_progress(redis: Redis, task_id: str) -> dict:
     data = await redis.json().get(f"{PROGRESS_PREFIX}{task_id}")
     if not data:
         raise TaskIDNotFoundError(detail=f"Task ID: '{task_id}' not found.")
+    if data.get("status") == Status.PROCESSING and data.get("worker"):
+        # Воркер шлёт heartbeat каждые 10 с (TTL 30 с). Нет ключа — процесс убит
+        # (чаще всего OOM в Docker), и задача иначе висела бы «processing» до TTL,
+        # а ARK ждал бы её 3 часа.
+        if not await redis.exists(f"{WORKER_PREFIX}{data['worker']}"):
+            details = (
+                f"audio-proc worker {data['worker']} died during stage '{data.get('stage')}' "
+                "(process killed, most likely out of memory); retry the task"
+            )
+            await Progress(redis, task_id).error(details)
+            data = await redis.json().get(f"{PROGRESS_PREFIX}{task_id}") or data
     return data

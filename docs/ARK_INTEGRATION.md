@@ -36,8 +36,10 @@
   "stage": "ingest | diarization | langid | asr | assemble | analysis | report",
   "total_stages": 5, "current_stage": 3,     // transcribe=5, analyze=6, report=7, rebuild=2
   "total": 12, "current": 7,                 // внутри стадии: сегменты ASR / куски анализа
-  "warnings": ["speaker_count_low"],         // опц.: no_speech, asr_mostly_empty, speakers_merged, lid_low_confidence, speaker_too_short_for_lid, analysis_failed, pdf_failed
+  "warnings": ["speaker_count_low"],         // опц.: no_speech, asr_mostly_empty, speakers_merged, lang_switch_detected, lang_ambiguous_chunks, asr_lang_unsupported, asr_chunks_rejected, lid_low_confidence, speaker_too_short_for_lid, analysis_failed, pdf_failed
   "details": "текст ошибки",                 // только при error
+                                             // в т.ч. «audio-proc worker … died during stage …» — процесс воркера убит
+                                             // (обычно OOM); задачу нужно перезапустить кнопкой Retry
   "processed_document": { … DocumentResponse … },   // главный результат операции
   "documents": {                             // все результаты; ARK сохраняет каждый
     "transcript": { "id": 12, "name": "meeting_transcript.json", "url": "https://…", "kind": "transcript", "object_key": "…", "parent_id": 11, "operation_name": "report", "language_code": "ru", "created_at": "iso", "usage": {…} },
@@ -53,12 +55,23 @@ ARK опрашивает каждые 4 с, сдаётся через 3 ч; те
 
 ### transcript.json (кратко; полная схема — STT_PIPELINE_PLAN.md §7)
 
+Язык определяется на каждый кусок ASR (`segments[].chunks`, с 2026-09-24): один спикер может говорить на двух языках;
+`speakers[].language` — язык большинства, `languages` — раскладка по времени речи внутри сегментов (сумма `speech_sec` может
+быть меньше `total_speech_sec`: паузы по VAD не считаются). `chunks` есть всегда (в legacy-режиме `lang_source: "speaker"`);
+`lang_source`: own | prev | next | speaker_prior | file_majority | default | speaker | served_fallback | asr_fallback | asr_text;
+`served_fallback` — язык по аудио не обслуживается ASR-бэкендом, исходный язык в `lid_language`, `warning: "lang_unserved:<lang>"`.
+`warning` куска: `text_check:<причины>` (текст оставлен, но похож не на тот язык), `lang_unserved:<lang>`, `asr_rejected`
+(бэкенд отверг кусок — текст пуст). `language_code` документа-транскрипта — язык большинства речи файла.
+
 ```jsonc
 { "job_id": "…", "title": null,
   "audio": {"filename": "meeting.m4a", "duration_sec": 1834.2, "sample_rate": 16000},
-  "speakers": [{"id": "SPEAKER_00", "name": null, "language": "uz", "lang_confidence": 0.97, "total_speech_sec": 214.3, "segments_count": 18}],
-  "segments": [{"id": 0, "speaker": "SPEAKER_00", "language": "uz", "start": 12.4, "end": 18.92, "overlap": false, "overlap_with": [], "text": "…", "words": null}],
-  "meta": {"pipeline_version": "1.0.0", "models": {…}, "timings_sec": {…}, "config": {…}, "warnings": []} }
+  "speakers": [{"id": "SPEAKER_00", "name": null, "language": "uz", "lang_confidence": 0.97,
+                "languages": [{"language": "uz", "speech_sec": 207.1, "share": 0.97}, {"language": "ru", "speech_sec": 7.2, "share": 0.03}],
+                "total_speech_sec": 214.3, "segments_count": 18}],
+  "segments": [{"id": 0, "speaker": "SPEAKER_00", "language": "uz", "lang_confidence": 0.99, "start": 12.4, "end": 18.92, "overlap": false, "overlap_with": [], "text": "…", "words": null,
+                "chunks": [{"start": 12.4, "end": 18.9, "language": "uz", "lang_confidence": 0.99, "lang_source": "own", "text": "…"}]}],
+  "meta": {"pipeline_version": "1.1.0", "models": {…}, "timings_sec": {…}, "config": {…}, "warnings": []} }
 ```
 
 ### analysis.json (кратко; §7.1)

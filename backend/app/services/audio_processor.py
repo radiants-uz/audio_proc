@@ -26,6 +26,7 @@ from app.models.document import Document
 from app.schemas.document import DocumentResponse
 from app.schemas.progress import Stage
 from app.schemas.task_context import AudioTaskContext
+from app.services.audio_processing.analysis.stats import dominant_language
 from app.services.audio_processing.models import ModelRegistry
 from app.services.audio_processing.run import PipelineRunner
 from app.services.progress import Progress
@@ -71,7 +72,9 @@ def _base_name(context: AudioTaskContext) -> str:
     return name.rsplit(".", 1)[0] if "." in name else name
 
 
-async def process_audio(redis: Redis, models: ModelRegistry, context: AudioTaskContext) -> None:
+async def process_audio(
+    redis: Redis, models: ModelRegistry, context: AudioTaskContext, worker_id: str | None = None
+) -> None:
     progress = Progress(redis=redis, task_id=context.task_id)
     rebuild = context.transcript_document_id is not None
     stages = REBUILD_STAGES if rebuild else STAGES_BY_OPERATION[context.operation]
@@ -80,7 +83,7 @@ async def process_audio(redis: Redis, models: ModelRegistry, context: AudioTaskC
     work_dir = Path(tempfile.mkdtemp(prefix=f"{context.task_id[:8]}-", dir=tmp_root))
 
     try:
-        await progress.init(total_stages=len(stages), stage=stages[0])
+        await progress.init(total_stages=len(stages), stage=stages[0], worker_id=worker_id)
         llm_service = None
         if context.params.model:
             async with async_session() as db:
@@ -110,7 +113,7 @@ async def process_audio(redis: Redis, models: ModelRegistry, context: AudioTaskC
                 job_id=context.task_id,
                 params=context.params,
             )
-            main_lang = transcript["speakers"][0]["language"] if transcript["speakers"] else None
+            main_lang = dominant_language(transcript)
             documents["transcript"] = (
                 await _store(
                     json.dumps(transcript, ensure_ascii=False, indent=2).encode("utf-8"),

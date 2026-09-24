@@ -12,7 +12,7 @@ from app.models.service import Service
 from app.schemas.analysis import Analysis, LlmAnalysis, llm_json_schema
 from app.services.audio_processing.analysis import prompts
 from app.services.audio_processing.analysis.llm_base import LlmClient, LlmUsage
-from app.services.audio_processing.analysis.stats import compute_stats
+from app.services.audio_processing.analysis.stats import compute_stats, dominant_language
 from app.services.audio_processing.analysis.tokens import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -31,19 +31,32 @@ def format_transcript_lines(transcript: dict, speaker_names: dict[str, str] | No
         if not (seg.get("text") or "").strip():
             continue
         tag = " [overlap]" if seg.get("overlap") else ""
-        lines.append((seg["id"], f"[{_hms(seg['start'])}] #{seg['id']} {names.get(seg['speaker'], seg['speaker'])} ({seg.get('language', '')}){tag}: {seg['text'].strip()}"))
+        lang, text = segment_language_and_text(seg)
+        lines.append((seg["id"], f"[{_hms(seg['start'])}] #{seg['id']} {names.get(seg['speaker'], seg['speaker'])} ({lang}){tag}: {text}"))
     return lines
 
 
+def segment_language_and_text(seg: dict) -> tuple[str, str]:
+    """Метка языка и текст сегмента. Если куски сегмента на разных языках —
+    метка «uz+ru», а в тексте каждый кусок помечен своим языком, чтобы LLM
+    и читатель отчёта не считали русскую половину узбекской."""
+    chunks = [c for c in (seg.get("chunks") or []) if (c.get("text") or "").strip()]
+    langs: list[str] = []
+    for c in chunks:
+        if c.get("language") and c["language"] not in langs:
+            langs.append(c["language"])
+    if len(langs) <= 1:
+        return seg.get("language", "") or "", (seg.get("text") or "").strip()
+    text = " ".join(f"[{c.get('language', '')}] {c['text'].strip()}" for c in chunks)
+    return "+".join(langs), text
+
+
 def resolve_report_lang(transcript: dict, requested: str) -> str:
+    """auto → язык большинства речи всего файла (не «главного» спикера: он может быть двуязычным)."""
     if requested and requested != "auto":
         return requested
-    speakers = transcript.get("speakers", [])
-    if speakers:
-        best = max(speakers, key=lambda s: s.get("total_speech_sec", 0))
-        if best.get("language") in ("uz", "ru", "en"):
-            return best["language"]
-    return "ru"
+    lang = dominant_language(transcript)
+    return lang if lang in ("uz", "ru", "en") else "ru"
 
 
 def chunk_lines(lines: list[tuple[int, str]], chunk_tokens: int) -> list[list[tuple[int, str]]]:

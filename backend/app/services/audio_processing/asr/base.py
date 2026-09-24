@@ -13,6 +13,9 @@ class AsrWord:
 class AsrResult:
     text: str
     words: list[AsrWord] | None = None  # None — бэкенд не отдаёт слова
+    # Бэкенд отверг именно этот кусок (4xx: формат, длина, язык) — текст пуст,
+    # остальные куски батча не страдают. None — ответ штатный.
+    error: str | None = None
 
 
 class AsrClient(Protocol):

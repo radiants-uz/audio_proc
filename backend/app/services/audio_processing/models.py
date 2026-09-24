@@ -8,6 +8,7 @@ from app.services.audio_processing.denoise import DeepFilterDenoiser
 from app.services.audio_processing.diarize import Diarizer, build_diarizer
 from app.services.audio_processing.embedder import SpeakerEmbedder
 from app.services.audio_processing.langid import LanguageIdentifier
+from app.services.audio_processing.textcheck import TextPlausibility
 from app.services.audio_processing.vad import SileroVad
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ class ModelRegistry:
         self.langid = LanguageIdentifier()
         self.denoiser = DeepFilterDenoiser()
         self.vad = SileroVad()
+        self.textcheck = TextPlausibility()
         self.loaded = False
 
     def load_all(self) -> None:
@@ -32,5 +34,7 @@ class ModelRegistry:
             self.denoiser.load()
         if settings.asr.vad_chunks:
             self.vad.load()
+        if settings.asr.text_check:
+            self.textcheck.load()
         self.loaded = True
         logger.info("models loaded in %.1fs", time.perf_counter() - t0)

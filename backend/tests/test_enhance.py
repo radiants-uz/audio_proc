@@ -72,3 +72,23 @@ def test_broken_denoiser_is_skipped(monkeypatch, tmp_path):
     src = _wav(tmp_path / "audio16k.wav", amp=0.01)
     out, applied, stats = enh.enhance_for_asr(src, tmp_path / "audio16k_enh.wav", denoiser=BrokenDenoiser())
     assert "deepfilternet3" not in applied and out.exists()
+
+
+
+def test_chunked_denoise_reassembles_signal_with_crossfade():
+    from app.services.audio_processing.denoise import chunked
+
+    sr = 16000
+    x = np.random.default_rng(0).standard_normal(sr * 7).astype("float32")
+    calls = []
+
+    def identity(piece):
+        calls.append(len(piece) / sr)
+        return piece
+
+    y = chunked(identity, x, sr, chunk_sec=2.0, overlap_sec=0.5)
+    assert y.shape == x.shape and np.allclose(y, x, atol=1e-6)  # окна с кроссфейдом собираются в исходник
+    assert len(calls) > 1 and max(calls) <= 2.5 + 1e-6
+    # короткий файл — один вызов
+    calls.clear()
+    assert np.allclose(chunked(identity, x[: sr * 2], sr, 2.0, 0.5), x[: sr * 2]) and calls == [2.0]

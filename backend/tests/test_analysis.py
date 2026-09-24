@@ -9,7 +9,7 @@ from app.services.audio_processing.analysis.analyze import (
     resolve_report_lang,
 )
 from app.services.audio_processing.analysis.llm_base import LlmResponse, LlmUsage
-from app.services.audio_processing.analysis.stats import compute_stats
+from app.services.audio_processing.analysis.stats import compute_stats, dominant_language
 
 TRANSCRIPT = {
     "job_id": "j", "title": None,
@@ -45,6 +45,28 @@ def test_format_lines_skips_empty_and_marks_overlap():
 def test_resolve_report_lang_auto_picks_dominant():
     assert resolve_report_lang(TRANSCRIPT, "auto") == "ru"
     assert resolve_report_lang(TRANSCRIPT, "en") == "en"
+
+
+def test_report_lang_and_dominant_language_follow_file_majority_not_top_speaker():
+    """Главный спикер двуязычен (51 % ru), но по файлу больше узбекского."""
+    t = {**TRANSCRIPT, "speakers": [
+        {"id": "SPEAKER_00", "name": None, "language": "ru", "lang_confidence": 0.51, "total_speech_sec": 100, "segments_count": 1},
+        {"id": "SPEAKER_01", "name": None, "language": "uz", "lang_confidence": 1.0, "total_speech_sec": 95, "segments_count": 1},
+    ], "segments": [
+        {"id": 0, "speaker": "SPEAKER_00", "language": "ru", "start": 0, "end": 100, "overlap": False, "overlap_with": [], "text": "x", "words": None,
+         "chunks": [{"start": 0, "end": 51, "language": "ru", "text": "а"}, {"start": 51, "end": 100, "language": "uz", "text": "b"}]},
+        {"id": 1, "speaker": "SPEAKER_01", "language": "uz", "start": 100, "end": 195, "overlap": False, "overlap_with": [], "text": "c", "words": None},
+    ]}
+    assert dominant_language(t) == "uz" and resolve_report_lang(t, "auto") == "uz"
+
+
+def test_format_lines_tag_mixed_language_segments_per_chunk():
+    t = {**TRANSCRIPT, "segments": [
+        {"id": 0, "speaker": "SPEAKER_00", "language": "uz", "start": 0, "end": 10, "overlap": False, "overlap_with": [], "text": "Bugun boshlaymiz. Согласен.", "words": None,
+         "chunks": [{"start": 0, "end": 5, "language": "uz", "text": "Bugun boshlaymiz."}, {"start": 5, "end": 10, "language": "ru", "text": "Согласен."}]},
+    ]}
+    line = format_transcript_lines(t)[0][1]
+    assert "(uz+ru)" in line and line.endswith("[uz] Bugun boshlaymiz. [ru] Согласен.")
 
 
 def test_chunk_lines_respects_budget():
@@ -117,3 +139,25 @@ async def test_empty_transcript_no_llm_call():
     empty = {**TRANSCRIPT, "segments": [], "speakers": []}
     out = await analyze_transcript(llm, _svc(), empty, "uz")
     assert out["meta"]["warnings"] == ["no_speech"] and llm.calls == []
+
+
+def test_stats_by_language_uses_chunks_when_present():
+    t = {**TRANSCRIPT, "segments": [
+        {"id": 0, "speaker": "SPEAKER_00", "language": "uz", "start": 0, "end": 10, "overlap": False, "overlap_with": [], "text": "x", "words": None,
+         "chunks": [{"start": 0, "end": 6, "language": "ru", "text": "а"}, {"start": 6, "end": 10, "language": "uz", "text": "b"}]},
+    ]}
+    s = compute_stats(t)
+    assert {x["language"]: x["speech_sec"] for x in s["by_language"]} == {"ru": 6.0, "uz": 4.0}
+
+
+def test_stats_by_language_clips_padded_chunks_and_shares_sum_to_one():
+    t = {**TRANSCRIPT, "segments": [
+        {"id": 0, "speaker": "SPEAKER_00", "language": "ru", "start": 1, "end": 5, "overlap": False, "overlap_with": [], "text": "x", "words": None,
+         "chunks": [{"start": 0.85, "end": 5.15, "language": "ru", "text": "а"}]},
+        {"id": 1, "speaker": "SPEAKER_00", "language": "uz", "start": 10, "end": 12, "overlap": False, "overlap_with": [], "text": "y", "words": None,
+         "chunks": [{"start": 9.85, "end": 11.5, "language": "uz", "text": "b"}]},
+    ]}
+    s = compute_stats(t)
+    by = {x["language"]: x for x in s["by_language"]}
+    assert by["ru"]["speech_sec"] == 4.0 and by["uz"]["speech_sec"] == 1.5
+    assert abs(sum(x["share"] for x in s["by_language"]) - 1.0) < 0.002

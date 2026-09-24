@@ -27,6 +27,10 @@ class PyannoteDiarizer:
                 "read token into AUDIO_HF_TOKEN (or set DIARIZATION_BACKEND=simple for development)"
             )
         self._pipeline = Pipeline.from_pretrained(self.model_name, token=token)
+        # Меньшие батчи — меньший пик памяти на CPU (файл 6,7 мин ронял воркер по OOM).
+        for attr in ("segmentation_batch_size", "embedding_batch_size"):
+            if hasattr(self._pipeline, attr):
+                setattr(self._pipeline, attr, getattr(settings.diarization, attr))
         self._pipeline.to(torch.device(settings.audio.device))
         self._torch = torch
         logger.info("pyannote pipeline %s loaded on %s", self.model_name, settings.audio.device)

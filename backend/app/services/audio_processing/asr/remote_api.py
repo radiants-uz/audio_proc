@@ -41,17 +41,23 @@ class RemoteAsrClient:
                         files={cfg.file_field: ("segment.wav", wav_bytes, "audio/wav")},
                         data={cfg.lang_field: lang},
                     )
-                if resp.status_code >= 500:
+                if resp.status_code >= 500 or resp.status_code in (408, 429):
+                    # 5xx, таймаут и rate limit — временное: повторяем с паузой.
                     raise AsrApiError(f"ASR API HTTP {resp.status_code}: {resp.text[:200]}")
+                if resp.status_code in (401, 403):
+                    # Авторизация — фатально для всей задачи (не «язык не обслуживается»), повтор не поможет.
+                    raise AsrApiError(f"ASR API auth failed (HTTP {resp.status_code}): {resp.text[:200]}")
                 if resp.status_code >= 400:
-                    # 4xx — не ретраим: формат/параметры, повтор не поможет.
-                    raise AsrApiError(f"ASR API rejected request (HTTP {resp.status_code}): {resp.text[:200]}")
+                    # Остальные 4xx относятся к этому куску (формат, длина, язык): не ретраим
+                    # и не валим батч — отдаём пустой результат с описанием ошибки.
+                    logger.warning("ASR rejected chunk (%s, HTTP %d): %s", lang, resp.status_code, resp.text[:160])
+                    return AsrResult(text="", words=None, error=f"HTTP {resp.status_code}: {resp.text[:200]}")
                 payload = resp.json()
                 text = payload.get(cfg.text_field, "") if isinstance(payload, dict) else ""
                 return AsrResult(text=(text or "").strip() if isinstance(text, str) else "", words=None)
             except (httpx.TimeoutException, httpx.TransportError, AsrApiError) as e:
                 last_error = e
-                if isinstance(e, AsrApiError) and "rejected" in str(e):
+                if isinstance(e, AsrApiError) and "auth failed" in str(e):
                     raise
                 if attempt < cfg.retries:
                     delay = (2**attempt) + random.uniform(0, 0.5)
