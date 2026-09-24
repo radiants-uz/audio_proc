@@ -71,3 +71,12 @@ def test_padded_bounds_respects_neighbours():
     s, e = padded_bounds(segs[1], segs, 0.15, 100.0)
     assert abs(s - 4.95) < 1e-9 or s >= 4.9
     assert abs(e - 10.15) < 1e-9
+
+
+def test_no_overlap_with_speaker_absent_from_transcript():
+    """БЕНА: pyannote дал SPEAKER_01 только обрывки по 0.5 с внутри реплик SPEAKER_00,
+    эксклюзивных участков у него нет — «наложение» с ним не ставится."""
+    exclusive = [RawTurn(19.66, 26.81, "SPEAKER_00")]
+    turns = [RawTurn(19.66, 26.81, "SPEAKER_00"), RawTurn(20.8, 21.28, "SPEAKER_01"), RawTurn(21.39, 21.56, "SPEAKER_01")]
+    segs = build_segments(exclusive, turns, CFG)
+    assert len(segs) == 1 and not segs[0].overlap and segs[0].overlap_with == []

@@ -72,10 +72,15 @@ def split_long(turns: list[RawTurn], max_segment_sec: float, audio: np.ndarray |
 
 
 def mark_overlaps(segments: list[Segment], turns: list[RawTurn], overlap_min_sec: float) -> None:
+    """Наложение — только с спикером, который есть в транскрипте. pyannote может
+    выдать «спикера» из обрывков по 0,3–0,5 с внутри чужих реплик, не получившего
+    ни одного эксклюзивного участка: в транскрипте его нет, и помечать наложение
+    с ним — путать читателя (запись БЕНА, 2026-09-24)."""
+    present = {seg.speaker for seg in segments}
     for seg in segments:
         others = set()
         for t in turns:
-            if t.speaker == seg.speaker:
+            if t.speaker == seg.speaker or t.speaker not in present:
                 continue
             inter = min(seg.end, t.end) - max(seg.start, t.start)
             if inter > overlap_min_sec:
