@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import socket
+import uuid
 
 from redis.asyncio import Redis
 
@@ -19,6 +20,12 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
 HEARTBEAT_TTL = 30
+
+
+def new_worker_id() -> str:
+    """Свой id на каждый запуск. При рестарте контейнера hostname и PID те же,
+    так что heartbeat нового процесса выдавал бы за живого того, кто погиб с задачей."""
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
 async def process_audio_task(ctx, context: dict):
@@ -40,7 +47,7 @@ async def _heartbeat_loop(redis: Redis, worker_id: str):
 
 async def startup(ctx):
     ctx["redis"] = get_redis_client(decode_responses=True)
-    ctx["worker_id"] = f"{socket.gethostname()}:{os.getpid()}"
+    ctx["worker_id"] = new_worker_id()
     ctx["heartbeat"] = asyncio.create_task(_heartbeat_loop(ctx["redis"], ctx["worker_id"]))
 
     models = ModelRegistry()

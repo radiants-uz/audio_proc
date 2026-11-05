@@ -1,10 +1,12 @@
 """Обработчик задачи в воркере: скачать исходник → пайплайн → результаты в
 S3 + Document → progress.complete. Любая ошибка → progress.error."""
 
+import asyncio
 import json
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from redis.asyncio import Redis
@@ -24,7 +26,7 @@ from app.crud.document import create_document, get_document
 from app.crud.service import get_service
 from app.models.document import Document
 from app.schemas.document import DocumentResponse
-from app.schemas.progress import Stage
+from app.schemas.progress import Stage, Status
 from app.schemas.task_context import AudioTaskContext
 from app.services.audio_processing.analysis.stats import dominant_language
 from app.services.audio_processing.models import ModelRegistry
@@ -32,6 +34,8 @@ from app.services.audio_processing.run import PipelineRunner
 from app.services.progress import Progress
 
 logger = logging.getLogger(__name__)
+
+TIMEOUT_MARGIN_SEC = 5
 
 
 async def _store(
@@ -72,15 +76,30 @@ def _base_name(context: AudioTaskContext) -> str:
     return name.rsplit(".", 1)[0] if "." in name else name
 
 
+def _interrupted_details(stage: str | None, elapsed_sec: float) -> str:
+    limit = settings.arq.job_timeout
+    # Таймер arq стартует раньше нашего, поэтому точного равенства лимиту не будет.
+    if elapsed_sec >= limit - TIMEOUT_MARGIN_SEC:
+        return f"audio-proc stopped the task at stage '{stage}': it exceeded the {limit} s limit (ARQ_JOB_TIMEOUT)"
+    return f"audio-proc worker was stopped during stage '{stage}'; retry the task"
+
+
 async def process_audio(
     redis: Redis, models: ModelRegistry, context: AudioTaskContext, worker_id: str | None = None
 ) -> None:
     progress = Progress(redis=redis, task_id=context.task_id)
+    # API уже признал задачу упавшей (долго не было воркера) и ARK мог её
+    # перезапустить: считать результат, который никто не заберёт, незачем.
+    current = await progress.get()
+    if current and current.get("status") == Status.ERROR:
+        logger.warning("task %s already failed: %s; skipping", context.task_id, current.get("details"))
+        return
     rebuild = context.transcript_document_id is not None
     stages = REBUILD_STAGES if rebuild else STAGES_BY_OPERATION[context.operation]
     tmp_root = Path(settings.audio.tmp_dir)
     tmp_root.mkdir(parents=True, exist_ok=True)
     work_dir = Path(tempfile.mkdtemp(prefix=f"{context.task_id[:8]}-", dir=tmp_root))
+    started = time.monotonic()
 
     try:
         await progress.init(total_stages=len(stages), stage=stages[0], worker_id=worker_id)
@@ -167,6 +186,15 @@ async def process_audio(
         main_doc = documents.get(primary) or documents["transcript"]
         await progress.complete(document=main_doc, documents=documents)
         logger.info("task %s complete: %s", context.task_id, list(documents))
+    except asyncio.CancelledError:
+        # Таймаут arq и остановка воркера приходят как CancelledError, а это не
+        # Exception. Без записи статуса задача осталась бы в processing при живом
+        # воркере, и ARK ждал бы её до своего лимита в 3 часа.
+        stage = (await progress.get() or {}).get("stage")
+        details = _interrupted_details(stage, time.monotonic() - started)
+        logger.error("task %s interrupted: %s", context.task_id, details)
+        await progress.error(details=details)
+        raise
     except Exception as e:
         logger.exception("task %s failed", context.task_id)
         await progress.error(details=str(e)[:2000])

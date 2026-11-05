@@ -12,6 +12,10 @@ from app.core.config import settings
 from app.exceptions.base import TaskIDNotFoundError
 from app.schemas.progress import PROGRESS_PREFIX, WORKER_PREFIX, Stage, Status
 
+# Столько задача может ждать в очереди при полном отсутствии воркеров: хватает
+# на рестарт контейнера, а дольше ждать нечего — ARK впустую считал бы свои 3 часа.
+PENDING_WITHOUT_WORKER_SEC = 300
+
 
 class Progress:
     def __init__(self, redis: Redis, task_id: str):
@@ -101,10 +105,24 @@ async def init_task_progress(redis: Redis, meta: dict | None = None) -> str:
     return task_id
 
 
+async def _queued_without_workers(redis: Redis, data: dict) -> bool:
+    created_at = data.get("created_at")
+    if not created_at:
+        return False
+    if (datetime.now(UTC) - datetime.fromisoformat(created_at)).total_seconds() < PENDING_WITHOUT_WORKER_SEC:
+        return False
+    async for _ in redis.scan_iter(f"{WORKER_PREFIX}*"):
+        return False
+    return True
+
+
 async def get_task_progress(redis: Redis, task_id: str) -> dict:
     data = await redis.json().get(f"{PROGRESS_PREFIX}{task_id}")
     if not data:
         raise TaskIDNotFoundError(detail=f"Task ID: '{task_id}' not found.")
+    if data.get("status") == Status.PENDING and await _queued_without_workers(redis, data):
+        await Progress(redis, task_id).error("no audio-proc worker is running, the task was not started; retry the task")
+        return await redis.json().get(f"{PROGRESS_PREFIX}{task_id}") or data
     if data.get("status") == Status.PROCESSING and data.get("worker"):
         # Воркер шлёт heartbeat каждые 10 с (TTL 30 с). Нет ключа — процесс убит
         # (чаще всего OOM в Docker), и задача иначе висела бы «processing» до TTL,

@@ -40,6 +40,12 @@ class FakeRedis:
     async def expire(self, key, ttl):
         self.expired.append((key, ttl))
 
+    async def scan_iter(self, pattern):
+        prefix = pattern.rstrip("*")
+        for key in list(self.store):
+            if key.startswith(prefix):
+                yield key
+
 
 @pytest.mark.asyncio
 async def test_processing_task_without_heartbeat_becomes_error():
