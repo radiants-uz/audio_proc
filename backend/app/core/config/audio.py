@@ -29,6 +29,9 @@ class DiarizationSettings(BaseSettings):
     # Батчи pyannote (по умолчанию в pyannote 32): меньше — меньше пик памяти на CPU.
     segmentation_batch_size: int = 8
     embedding_batch_size: int = 8
+    # ResNet эмбеддингов один раз на окно вместо трёх (diarize/fast_embeddings.py);
+    # результат как у стока pyannote, false — вернуть стоковый код.
+    fast_embeddings: bool = True
     # simple-бэкенд (без HF-токена): VAD + эмбеддинги + агломеративная кластеризация.
     embedding_model: str = "speechbrain/spkrec-ecapa-voxceleb"
     cluster_threshold: float = 0.7

@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from app.core.config import settings
+from app.services.audio_processing.diarize import fast_embeddings
 from app.services.audio_processing.diarize.base import DiarizationResult, make_exclusive
 from app.services.audio_processing.types import RawTurn
 
@@ -33,7 +34,13 @@ class PyannoteDiarizer:
                 setattr(self._pipeline, attr, getattr(settings.diarization, attr))
         self._pipeline.to(torch.device(settings.audio.device))
         self._torch = torch
-        logger.info("pyannote pipeline %s loaded on %s", self.model_name, settings.audio.device)
+        fast = settings.diarization.fast_embeddings and fast_embeddings.install(self._pipeline)
+        logger.info(
+            "pyannote pipeline %s loaded on %s (fast embeddings: %s)",
+            self.model_name,
+            settings.audio.device,
+            "on" if fast else "off",
+        )
 
     def diarize(self, wav_path: Path, min_speakers: int | None, max_speakers: int | None) -> DiarizationResult:
         assert self._pipeline is not None, "call load() first"
