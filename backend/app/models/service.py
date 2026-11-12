@@ -25,6 +25,8 @@ class Service(Base):
     temperature = Column(Float, nullable=True, default=0.2)
 
     # Семафор параллельных запросов к эндпоинту (воркеры ходят одновременно).
+    # Не больше ANALYSIS_MAX_CONCURRENT_REQUESTS (8) на ключ: большее значение
+    # просто урезается (общий GLM-сервер).
     limit_requests = Column(Integer, nullable=False, default=2)
     # Переопределяют ANALYSIS_MAX_INPUT_TOKENS / ANALYSIS_CHUNK_TOKENS, если заданы.
     max_input_tokens = Column(Integer, nullable=True)

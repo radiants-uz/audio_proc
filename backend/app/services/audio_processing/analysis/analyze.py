@@ -3,6 +3,7 @@
 
 import json
 import logging
+from asyncio import sleep
 from collections.abc import Awaitable, Callable
 
 from pydantic import ValidationError
@@ -74,7 +75,8 @@ def chunk_lines(lines: list[tuple[int, str]], chunk_tokens: int) -> list[list[tu
 
 
 async def _ask(llm: LlmClient, system: str, user: str, max_tokens: int, lang: str, usage: LlmUsage) -> LlmAnalysis:
-    """Один вызов + один повтор с сообщением об ошибке валидации."""
+    """Один вызов + один повтор с сообщением об ошибке валидации. Повтор — не
+    сразу, а через паузу (общий GLM-сервер: запрос «в лоб» после ответа не шлём)."""
     schema = llm_json_schema()
     resp = await llm.complete_json(system, user, schema, max_tokens)
     usage.add(resp.usage)
@@ -82,6 +84,7 @@ async def _ask(llm: LlmClient, system: str, user: str, max_tokens: int, lang: st
         return LlmAnalysis.model_validate(resp.data)
     except ValidationError as e:
         logger.warning("LLM JSON failed validation, retrying once: %s", str(e)[:300])
+        await sleep(settings.analysis.retry_base_delay)
         repair = prompts.t(prompts.REPAIR, lang).format(error=str(e)[:1500])
         resp = await llm.complete_json(system, user + "\n\n" + repair, schema, max_tokens)
         usage.add(resp.usage)

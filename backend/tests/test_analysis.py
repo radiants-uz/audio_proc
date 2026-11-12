@@ -2,6 +2,7 @@ import pytest
 
 from app.models.service import Service
 from app.schemas.analysis import Analysis, llm_json_schema
+from app.services.audio_processing.analysis import analyze as analyze_module
 from app.services.audio_processing.analysis.analyze import (
     analyze_transcript,
     chunk_lines,
@@ -112,17 +113,32 @@ async def test_single_call_and_segment_id_filter():
     Analysis.model_validate(out)
 
 
+@pytest.fixture
+def pauses(monkeypatch):
+    """Паузы перед повтором не ждём, а записываем."""
+    recorded = []
+
+    async def fake_sleep(seconds):
+        recorded.append(seconds)
+
+    monkeypatch.setattr(analyze_module, "sleep", fake_sleep)
+    return recorded
+
+
 @pytest.mark.asyncio
-async def test_invalid_json_repaired_once():
+async def test_invalid_json_repaired_once(pauses):
     llm = FakeLlm([{"nonsense": 1}, GOOD])
     out = await analyze_transcript(llm, _svc(), TRANSCRIPT, "ru")
     assert out is not None and len(llm.calls) == 2 and "валидацию" in llm.calls[1]
+    # Повтор — не «в лоб», а через паузу (общий GLM-сервер).
+    assert pauses == [5.0]
 
 
 @pytest.mark.asyncio
-async def test_twice_invalid_returns_none():
+async def test_twice_invalid_returns_none(pauses):
     llm = FakeLlm([{"nonsense": 1}, {"still": 2}])
     assert await analyze_transcript(llm, _svc(), TRANSCRIPT, "ru") is None
+    assert len(llm.calls) == 2 and pauses == [5.0]  # один повтор, не больше
 
 
 @pytest.mark.asyncio

@@ -146,8 +146,18 @@ class AnalysisSettings(BaseSettings):
     max_input_tokens: int = 40000
     chunk_tokens: int = 30000
     max_output_tokens: int = 8000
+    # Правила общего GLM-сервера (его делят все отделы и боевые сервисы, он
+    # обрабатывает 32 запроса разом, остальные ждут в общей очереди):
+    #  - таймаут клиента не больше 300 с (в коде зажат до 300 при любом значении);
+    #  - при 429/5xx/обрыве — паузы retry_base_delay, 2x, 4x… (5, 10, 20 с) и не
+    #    больше retries повторов (3);
+    #  - не больше max_concurrent_requests одновременных запросов с одного ключа
+    #    (Service.limit_requests может только уменьшить). Больше — только по
+    #    согласованию с администратором GLM.
     timeout_sec: float = 300.0
     retries: int = 3
+    retry_base_delay: float = 5.0
+    max_concurrent_requests: int = 8
     default_report_lang: str = "auto"
 
     model_config = SettingsConfigDict(

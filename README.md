@@ -118,6 +118,11 @@ sh scripts/run.sh up   # docker compose -f docker-compose.yml -f docker-compose.
 - `SEGMENTS_*` пороги склейки/разрезания, `LANGID_*` пороги языка
 - `ASR_BACKEND`, `ASR_API_URL`, `ASR_CONCURRENCY`, `ASR_TIMEOUT_SEC`, `ASR_RETRIES`
 - `ANALYSIS_MAX_INPUT_TOKENS=40000`, `ANALYSIS_CHUNK_TOKENS=30000` (контекст локальной GLM-5.3 — 120k)
+- `ANALYSIS_TIMEOUT_SEC=300`, `ANALYSIS_RETRIES=3`, `ANALYSIS_RETRY_BASE_DELAY=5`, `ANALYSIS_MAX_CONCURRENT_REQUESTS=8` —
+  правила **общего GLM-сервера** (его делят все отделы и боевые сервисы, он принимает 32 запроса разом, остальные ждут в
+  общей очереди): не больше 8 параллельных запросов с одного ключа, таймаут не больше 300 с, при 429/5xx паузы 5/10/20 с
+  и не больше 3 повторов. Массовые прогоны согласуйте с администратором GLM заранее и запускайте вечером или ночью.
+  Один ключ — один сервис: не передавайте его и не публикуйте в коде и чатах.
 - `ARQ_MAX_WORKERS=1`, `ARQ_JOB_TIMEOUT=3600`, `ARQ_MAX_TRIES=1`
 
 ## Нейросетевая чистка звука (2026-09-23)

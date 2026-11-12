@@ -8,13 +8,18 @@
   (проверено 2026-09-20), поэтому по умолчанию он выключен;
 - reasoning_effort передаётся через extra_body (vLLM/SGLang принимают его
   в теле запроса; reasoning-контент в ответе игнорируем, берём message.content);
-- ретраи с экспоненциальной паузой, семафор на параллельные запросы."""
+- GLM — общий сервер (32 запроса разом на все отделы и боевые сервисы), поэтому:
+  не больше ANALYSIS_MAX_CONCURRENT_REQUESTS (8) одновременных запросов с одного
+  ключа (один семафор на ключ в процессе, а не на клиента — клиент создаётся на
+  каждую задачу); таймаут клиента ≤ 300 с; при 429/5xx и обрывах паузы 5, 10, 20 с
+  и не больше ANALYSIS_RETRIES (3) повторов, никаких повторов «в лоб»."""
 
 import asyncio
 import json
 import logging
 import random
 import re
+from asyncio import sleep
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
@@ -25,6 +30,32 @@ from app.services.audio_processing.analysis.llm_base import LlmResponse, LlmUsag
 logger = logging.getLogger(__name__)
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
+
+# Потолок таймаута клиента на общем GLM-сервере: запрос дольше висит в очереди
+# сервера, а шлюз рвёт его на 300 с. ANALYSIS_TIMEOUT_SEC может только уменьшить.
+LLM_MAX_TIMEOUT = 300.0
+
+# (base_url, ключ) -> (цикл событий, семафор). Ключ в логи не попадает.
+_key_semaphores: dict[tuple[str, str], tuple[asyncio.AbstractEventLoop | None, asyncio.Semaphore]] = {}
+
+
+def key_semaphore(base_url: str | None, api_key: str | None, limit: int | None) -> asyncio.Semaphore:
+    """Общий на процесс семафор ключа: размер min(limit_requests, 8). Клиент
+    создаётся на каждую задачу, а лимит должен быть общим для всех задач воркера
+    с этим ключом. Если ключ у нескольких сервисов, размер берётся у первого
+    созданного — потолок в любом случае не превышен."""
+    size = max(1, min(limit or 1, settings.analysis.max_concurrent_requests))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    key = (base_url or "", api_key or "")
+    entry = _key_semaphores.get(key)
+    # Семафор привязан к циклу событий: в новом цикле (перезапуск, тесты) — новый.
+    if entry is None or entry[0] is not loop:
+        entry = (loop, asyncio.Semaphore(size))
+        _key_semaphores[key] = entry
+    return entry[1]
 
 
 class LlmError(Exception):
@@ -55,10 +86,12 @@ class OpenAICompatibleClient:
         self._client = AsyncOpenAI(
             base_url=service.base_url,
             api_key=service.api_key or "not-needed",
-            timeout=settings.analysis.timeout_sec,
+            timeout=min(settings.analysis.timeout_sec, LLM_MAX_TIMEOUT),
+            # Повторы и паузы делает только complete_json: встроенные повторы SDK
+            # идут почти без пауз и перемножались бы с нашими.
             max_retries=0,
         )
-        self._sem = asyncio.Semaphore(max(1, service.limit_requests or 1))
+        self._sem = key_semaphore(service.base_url, service.api_key, service.limit_requests)
 
     async def complete_json(self, system: str, user: str, schema: dict, max_tokens: int) -> LlmResponse:
         if self.service.use_json_schema:
@@ -113,7 +146,9 @@ class OpenAICompatibleClient:
             except (APIConnectionError, APITimeoutError, json.JSONDecodeError, LlmError) as e:
                 last = e
             if attempt < settings.analysis.retries:
-                delay = 2**attempt + random.uniform(0, 1)
+                # Пауза растёт с каждым повтором: 5, 10, 20 с (+ до 1 с разброса,
+                # чтобы воркеры не повторяли синхронно).
+                delay = settings.analysis.retry_base_delay * 2**attempt + random.uniform(0, 1)
                 logger.warning("LLM attempt %d failed (%s); retry in %.1fs", attempt + 1, last, delay)
-                await asyncio.sleep(delay)
+                await sleep(delay)
         raise LlmError(f"LLM unavailable after {settings.analysis.retries + 1} attempts: {last}") from last
